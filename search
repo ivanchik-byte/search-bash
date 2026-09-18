@@ -83,7 +83,7 @@ PROVIDERS = {
     },
     "nvidia": {
         "name": "Nvidia NIM",
-        "default_model": "meta/llama-3.3-70b-instruct",
+        "default_model": "nvidia/nemotron-3.5-lightning-30b-a3b",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "key_url": "https://build.nvidia.com",
     },
@@ -699,7 +699,7 @@ def main():
   search "how to configure reverse proxy in nginx"
   search -c "find files larger than 50MB and sort by size"
   search -p openrouter -m meta-llama/llama-3.3-70b-instruct "explain b-trees"
-  search -p nvidia -m meta/llama-3.3-70b-instruct "optimize cuda kernel"
+  search -p nvidia -m nvidia/nemotron-3.5-lightning-30b-a3b "optimize cuda kernel"
   search -s stackoverflow.com "python typeerror unhashable type"
   search -f ./nginx.conf "explain ssl configuration"
   search -d . "summarize project architecture"

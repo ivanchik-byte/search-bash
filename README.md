@@ -12,7 +12,7 @@ Zero mandatory dependencies. Runs on standard Python 3.10+.
 
 - **Google Gemini** (Google AI Studio) — Search Grounding with live Google results.
 - **OpenRouter** (openrouter.ai) — 200+ models (Claude, Llama, DeepSeek, Mistral) with optional search grounding.
-- **Nvidia NIM** (integrate.api.nvidia.com) — High-throughput inference for Llama 3.3, Nemotron, Mistral.
+- **Nvidia NIM** (integrate.api.nvidia.com) — High-throughput inference for Nemotron, DeepSeek, Mistral.
 - **Custom / Local** (Ollama, Groq, vLLM, LiteLLM) — Any OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ---
@@ -60,7 +60,7 @@ search --set-model "meta-llama/llama-3.3-70b-instruct"
 ```bash
 search --set-provider nvidia
 search --set-key "nvapi-..."
-search --set-model "meta/llama-3.3-70b-instruct"
+search --set-model "nvidia/nemotron-3.5-lightning-30b-a3b"
 ```
 
 ### Local Ollama / Custom:
