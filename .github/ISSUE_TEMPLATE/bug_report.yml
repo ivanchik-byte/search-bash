@@ -1,0 +1,52 @@
+name: Bug Report
+description: Report unexpected behavior or a crash in search-bash
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please make sure you are using the latest version (`git pull` or re-run `install.sh`).
+  - type: input
+    id: version
+    attributes:
+      label: CLI Version
+      description: Run `search --version` and paste output here
+      placeholder: search 1.1.1
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python Version
+      placeholder: Ubuntu 24.04, Python 3.12, bash 5.2
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Active Provider
+      options:
+        - Gemini
+        - Nvidia NIM
+        - OpenRouter
+        - Custom / Local Ollama
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact command line and query used
+      placeholder: |
+        1. Run `search -a`
+        2. Enter file rank `1`
+        3. See error output: ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs Actual Behavior
+      placeholder: Expected the file to be summarized, but received connection error.
+    validations:
+      required: true

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Reporting
+    url: https://github.com/ivanchik-byte/search-bash/security/advisories/new
+    about: Please report security vulnerabilities privately.
+  - name: Direct Contact on Telegram
+    url: https://t.me/ivanchikbyte
+    about: Quick questions and discussions with the author.

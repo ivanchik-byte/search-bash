@@ -1,167 +1,171 @@
-# search
+<div align="center">
 
-A single-file terminal intelligence and search utility with multi-provider AI support (Google Gemini, OpenRouter, Nvidia NIM, and OpenAI-compatible endpoints).
+**English** | [Русский](READMEru.md)
 
-Designed for Linux servers, remote SSH sessions, and DevOps workflows. Returns verified documentation, executable shell commands, and project-aware analysis directly inside your terminal.
+# search-bash
 
-Zero mandatory dependencies. Runs on standard Python 3.10+.
+A fast, standalone terminal search and AI assistant for Linux and macOS.  
+Zero external dependencies. Pure Python 3.10+.
+
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey?style=flat-square)]()
+[![Telegram](https://img.shields.io/badge/Telegram-@ivanchikbyte-2CA5E0?style=flat-square&logo=telegram&logoColor=white)](https://t.me/ivanchikbyte)
+
+<br />
+
+![search-bash demo](demo.gif)
+
+</div>
 
 ---
 
-## Supported Providers
+## Quick Install
 
-- **Google Gemini** (Google AI Studio) — Search Grounding with live Google results.
-- **OpenRouter** (openrouter.ai) — 200+ models (Claude, Llama, DeepSeek, Mistral) with optional search grounding.
-- **Nvidia NIM** (integrate.api.nvidia.com) — High-throughput inference for Nemotron, DeepSeek, Mistral.
-- **Custom / Local** (Ollama, Groq, vLLM, LiteLLM) — Any OpenAI-compatible `/v1/chat/completions` endpoint.
-
----
-
-## Installation (One Line)
-
-Download the executable script directly into `~/.local/bin`:
+One command downloads the standalone script to `~/.local/bin/search` and makes it executable:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/<your-username>/search/main/search -o ~/.local/bin/search && chmod +x ~/.local/bin/search
+curl -fsSL https://raw.githubusercontent.com/ivanchik-byte/search-bash/main/install.sh | bash
 ```
 
-Ensure `~/.local/bin` is in your `PATH`:
+<details>
+<summary>Other install options</summary>
+
+### Direct download
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/ivanchik-byte/search-bash/main/search -o ~/.local/bin/search
+chmod +x ~/.local/bin/search
 ```
+
+### Git clone
+```bash
+git clone https://github.com/ivanchik-byte/search-bash.git ~/.search-bash
+mkdir -p ~/.local/bin
+ln -sf ~/.search-bash/search ~/.local/bin/search
+```
+
+Make sure `~/.local/bin` is in your `$PATH`:
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+</details>
 
 ---
 
-## Setup & Provider Configuration
+## Quick Setup
 
-Run the setup wizard to choose your provider and configure your API key:
+Run the setup wizard on your first run:
 
 ```bash
 search --setup
 ```
 
-Or configure directly via CLI flags:
+It walks you through selecting a provider and prompts for your API key securely (input is hidden without terminal echo).
 
-### Google Gemini:
-```bash
-search --set-provider gemini
-search --set-key "AIzaSy..."
-search --set-model "gemini-3.5-flash-lite"
-```
+Settings and keys are saved locally in `~/.config/search/config.json` with strict `0600` file permissions.
 
-### OpenRouter:
-```bash
-search --set-provider openrouter
-search --set-key "sk-or-v1-..."
-search --set-model "meta-llama/llama-3.3-70b-instruct"
-```
+### Supported Providers
 
-### Nvidia NIM:
-```bash
-search --set-provider nvidia
-search --set-key "nvapi-..."
-search --set-model "nvidia/nemotron-3.5-lightning-30b-a3b"
-```
-
-### Local Ollama / Custom:
-```bash
-search --set-provider custom
-search --set-url "http://localhost:11434/v1"
-search --set-model "llama3.2"
-```
+| Provider | Default Model | Live Web Search | Best For |
+| :--- | :--- | :--- | :--- |
+| **Google Gemini** | `gemini-3.5-flash-lite` | Yes (Google Search Grounding) | Fast lookups, current docs, free tier |
+| **Nvidia NIM** | `nvidia/nemotron-3.5-lightning-30b-a3b` | No | Deep reasoning and fast coding inference |
+| **OpenRouter** | `meta-llama/llama-3.3-70b-instruct` | Optional | Access to 200+ models (Claude, Llama, DeepSeek) |
+| **Custom / Local** | User specified | No | Local Ollama, Groq, vLLM, private endpoints |
 
 ---
 
-## Features
+## What You Can Do
 
-- **Single-File Architecture**: Everything lives in one self-contained script (`search`).
-- **Multi-Provider**: Switch between Gemini, OpenRouter, Nvidia, or local models anytime (`-p <provider>`).
-- **Interactive Wizard**: Run `search` with no arguments to step through query formulation and command execution.
-- **Command Generator (`-c`)**: Generates exact, copy-pasteable Linux commands with an interactive prompt to execute them.
-- **Codebase & File Context (`-f`, `-d`)**: Analyzes specific files or scans repository directory trees (filtering noise like `.git`, `node_modules`, `venv`).
-- **Domain Targeting (`-s`)**: Restricts search scope to specific documentation sites (e.g. `stackoverflow.com`, `docs.docker.com`).
-- **Unix Pipelines**: Reads stdin streams (`cat /var/log/syslog | search "explain root cause"`).
-- **Local Caching**: Repeated identical queries return instantly from `~/.cache/search_cli/`.
-- **Clean Terminal UI**: Strict Unix style. No emojis, no marketing chatter.
+### 1. Fast terminal lookups with real web results
 
----
+Ask technical questions right from your shell. With Gemini, responses come grounded with real Google Search results:
 
-## Usage Examples
-
-### 1. Interactive Mode
 ```bash
-search
+search "how to configure nginx reverse proxy for websockets"
 ```
 
-### 2. General Technical Search
+### 2. Generate and run shell commands
+
+Use `-c` when you know what you want to do, but forget the syntax. It outputs the command and asks if you want to execute it:
+
 ```bash
-search "how to configure reverse proxy in nginx for websocket"
-search -p openrouter -m meta-llama/llama-3.3-70b-instruct "explain b-trees"
+search -c "find all files over 500MB modified in the last 7 days"
 ```
-
-### 3. Generate and Execute Shell Commands (`-c`)
-```bash
-search -c "find files larger than 100MB and sort by size"
-```
-Output:
-```
-find / -type f -size +100M -exec ls -lh {} + 2>/dev/null | awk '{ print $5, $9 }' | sort -hr
-
-Execute command? [y/N]: y
-```
-
-### 4. Inspect Files and Repositories (`-f`, `-d`)
-```bash
-# Analyze a configuration file:
-search -f /etc/nginx/nginx.conf "identify potential performance bottlenecks"
-
-# Analyze a repository structure:
-search -d . "summarize project architecture and entry points"
-```
-
-### 5. Piped Input
-```bash
-cat /var/log/nginx/error.log | search "what caused this error and how to fix it"
-dmesg | tail -n 50 | search
-```
-
----
-
-## Command-Line Options
 
 ```text
-usage: search [-h] [-c] [-p {gemini,openrouter,nvidia,custom}] [-m NAME]
-              [-s DOMAIN] [-f PATH] [-d PATH] [-i] [-w] [-r] [-y] [--setup]
-              [--no-cache] [--clear-cache] [--set-provider {gemini,openrouter,nvidia,custom}]
-              [--set-key KEY] [--set-model MODEL] [--set-url URL] [--set-site DOMAIN]
-              [--force] [-v] [query ...]
+find . -type f -size +500M -mtime -7 -exec ls -lh {} +
 
-positional arguments:
-  query                 Query or prompt to process
-
-options:
-  -h, --help            Show this help message and exit
-  -c, --cmd             Generate an executable shell command
-  -p, --provider        Switch provider (gemini, openrouter, nvidia, custom)
-  -m, --model NAME      Model identifier
-  -s, --site DOMAIN     Scope search to a specific domain
-  -f, --file PATH       Attach file content as context
-  -d, --dir PATH        Attach directory tree and structure as context
-  -i, --interactive     Launch interactive wizard
-  -w, --no-web          Disable web search grounding
-  -r, --raw             Output plain unformatted text
-  -y, --yes             Auto-execute generated command without confirmation
-  --setup               Run provider and key configuration wizard
-  --force               Force save settings even if validation warns
-  --no-cache            Bypass local cache
-  --clear-cache         Clear local cache
-  --set-provider        Set default provider
-  --set-key KEY         Save API key for active provider
-  --set-model MODEL     Save default model for active provider
-  --set-url URL         Save custom Base URL
-  --set-site DOMAIN     Save default search domain
-  -v, --version         Show program's version number and exit
+Execute command? [y/N]:
 ```
+
+### 3. Analyze directories and clean disk space
+
+Use `-a` (or `-d <path>`) to inspect folders. It groups files, highlights the largest disk consumers, collapses clutter like `node_modules` or `.git`, and suggests what is safe to delete:
+
+```bash
+search -a
+```
+
+After the overview is displayed, you can inspect candidate files directly by rank number or file path:
+
+```text
+Inspect file content? [1-10 or file path, Enter to finish]: 1
+... [AI checks file purpose and safety] ...
+Delete 'dump_2026.sql'? [y/N]: y
+```
+
+### 4. Pipe logs and diagnostics
+
+Pipe stdout or log files directly into `search` to diagnose errors and stack traces:
+
+```bash
+cat /var/log/nginx/error.log | search "explain why this connection dropped"
+```
+
+### 5. Attach files and logs
+
+Pass files or glob patterns with `-f`. It handles large files with intelligent tail sampling:
+
+```bash
+search -f "*.log" "summarize errors from the last 24 hours"
+```
+
+---
+
+## Command Reference
+
+| Option | Description |
+| :--- | :--- |
+| `-c, --cmd` | Generate an executable shell command with confirmation prompt |
+| `-a, --all-files` | Scan current directory and highlight cleanup candidates |
+| `-d, --dir PATH` | Scan a specific folder structure |
+| `-f, --file PATH` | Attach file or glob pattern (`-f "*.log"`, `-f file.txt:tail:100`) |
+| `-p, --provider NAME` | Override provider for one query (`gemini`, `nvidia`, `openrouter`, `custom`) |
+| `-m, --model NAME` | Override model identifier for one query |
+| `-s, --site DOMAIN` | Scope web search to a specific domain (e.g. `docs.docker.com`) |
+| `-i, --interactive` | Launch interactive wizard session |
+| `-w, --no-web` | Disable web search grounding |
+| `-r, --raw` | Output plain text without borders or boxes |
+| `-y, --yes` | Auto-execute generated command without confirmation |
+| `--setup` | Run interactive provider and key setup |
+| `--clear-cache` | Clear cached query responses in `~/.cache/search_cli/` |
+
+---
+
+## Why I wrote this
+
+I wrote search-bash because I needed to turn on my PC and log into a VM. But before doing that, I had to check something in the browser. Since I use Firefox, I just didn't want to open the browser, wait for all my tabs to restore, open a new tab, google what I needed, close that tab, kill the process via pkill (so that my previous tabs wouldn't get wiped out and force me to hit Ctrl+Shift+T later), and only then start logging into the VM. So, I built this simple and fun little CLI tool instead.
+
+---
+
+## Community & Security
+
+- **Contributing**: Read [CONTRIBUTING.md](CONTRIBUTING.md) for local development guidelines.
+- **Code of Conduct**: See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- **Security**: For private vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
 ---
 
