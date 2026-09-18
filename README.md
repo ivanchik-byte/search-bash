@@ -1,84 +1,64 @@
-# search-cli
+# search
 
-Terminal search, codebase inspection, and command-line AI assistant powered by Google Search Grounding.
+A single-file terminal intelligence and search utility powered by Google Search Grounding.
 
-Designed for Linux systems, remote SSH servers, and DevOps workflows. Returns concise answers, verified documentation links, executable shell commands, and codebase analysis directly inside your terminal.
+Designed for Linux servers, remote SSH sessions, and DevOps workflows. Returns verified documentation, executable shell commands, and project-aware analysis directly inside your terminal.
 
----
-
-## Features
-
-- **Interactive Wizard**: Launch without arguments (`search`) to step through guided queries, domain targeting, and command execution.
-- **Google Search Grounding**: Fetches up-to-date documentation and articles from live Google search, complete with clickable source links.
-- **Command Generator (`-c`)**: Generates exact, copy-pasteable Linux commands with an interactive prompt to execute immediately.
-- **Codebase & File Context (`-f`, `-d`)**: Reads individual files or scans repository trees (filtering noise like `.git`, `node_modules`, `venv`) to answer project-specific questions.
-- **Domain Targeting (`-s`)**: Restricts search scope to specific documentation sites (e.g. `stackoverflow.com`, `docs.docker.com`, `github.com`).
-- **Unix Pipeline Support**: Accepts piped logs, configs, or command outputs (`cat /var/log/syslog | search "find root cause"`).
-- **Local Caching**: Repeated identical queries return within milliseconds from `~/.cache/search_cli/`, preserving API quotas.
-- **Clean Terminal UI**: Formatted with clean ASCII blocks and syntax-highlighted Markdown. No emojis, no marketing chatter.
+Zero mandatory dependencies. Runs on standard Python 3.10+.
 
 ---
 
-## Installation
+## Installation (One Line)
 
-### Option 1: Using pipx (Recommended)
-
-```bash
-git clone https://github.com/<your-username>/search-cli.git
-cd search-cli
-pipx install .
-```
-
-To install directly from GitHub:
-```bash
-pipx install git+https://github.com/<your-username>/search-cli.git
-```
-
-### Option 2: Local Install Script
+Download the executable script directly into `~/.local/bin`:
 
 ```bash
-git clone https://github.com/<your-username>/search-cli.git
-cd search-cli
-chmod +x install.sh
-./install.sh
+curl -sSL https://raw.githubusercontent.com/<your-username>/search/main/search -o ~/.local/bin/search && chmod +x ~/.local/bin/search
 ```
 
-### Option 3: Standard pip
-
+Ensure `~/.local/bin` is in your `PATH`:
 ```bash
-pip install .
+export PATH="$HOME/.local/bin:$PATH"
 ```
-
-Ensure `~/.local/bin` is in your `PATH`.
 
 ---
 
-## Configuration
+## Setup
 
-On your first run, `search` will automatically prompt you for your Gemini API key and validate it against the API:
+Run `search` without arguments to launch the first-run configuration wizard:
 
 ```bash
 search
 ```
 
+It will prompt for your free Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey), validate it, and store it in `~/.config/search/config.json`.
+
 Alternatively, configure the key directly:
-
 ```bash
-# Save to ~/.config/search/config.json
 search --set-key "AIzaSy..."
-
-# Or set via environment variable:
+# or
 export GEMINI_API_KEY="AIzaSy..."
 ```
 
-A free API key can be obtained at [Google AI Studio](https://aistudio.google.com/app/apikey).
+---
+
+## Features
+
+- **Single-File Architecture**: Everything lives in one self-contained script (`search`). No virtual environments, no package clutter.
+- **Interactive Wizard**: Run `search` with no arguments to step through query formulation, target domain selection, and command execution.
+- **Live Google Search Grounding**: Retrieves current web results with clickable source links.
+- **Command Generator (`-c`)**: Generates exact, copy-pasteable Linux commands with an interactive prompt to execute them.
+- **Codebase & File Context (`-f`, `-d`)**: Analyzes specific files or scans repository directory trees (filtering noise like `.git`, `node_modules`, `venv`).
+- **Domain Targeting (`-s`)**: Restricts search scope to specific documentation sites (e.g. `stackoverflow.com`, `docs.docker.com`).
+- **Unix Pipelines**: Reads stdin streams (`cat /var/log/syslog | search "explain root cause"`).
+- **Local Caching**: Repeated identical queries return instantly from `~/.cache/search_cli/`, preserving API quotas.
+- **Clean Terminal UI**: Strict Unix style. No emojis, no marketing chatter.
 
 ---
 
 ## Usage Examples
 
 ### 1. Interactive Mode
-Run without arguments to enter the interactive prompt:
 ```bash
 search
 ```
@@ -91,7 +71,7 @@ search "systemd service restart limit configuration"
 
 ### 3. Generate and Execute Shell Commands (`-c`)
 ```bash
-search -c "find all files larger than 100MB and sort by size"
+search -c "find files larger than 100MB and sort by size"
 ```
 Output:
 ```
@@ -99,7 +79,7 @@ find / -type f -size +100M -exec ls -lh {} + 2>/dev/null | awk '{ print $5, $9 }
 
 Execute command? [y/N]: y
 ```
-Use `-y` to execute automatically without prompting:
+To auto-execute without confirmation:
 ```bash
 search -c -y "show free memory in human readable format"
 ```
@@ -148,10 +128,12 @@ positional arguments:
 options:
   -h, --help            Show this help message and exit
   -c, --cmd             Generate an executable shell command
-  -s, --site DOMAIN     Scope search to a specific domain
-  -f, --file PATH       Attach file content as context
-  -d, --dir PATH        Attach directory tree and structure as context
-  -m, --model NAME      Gemini model identifier (default: gemini-3.5-flash-lite)
+  -s DOMAIN, --site DOMAIN
+                        Scope search to a specific domain
+  -f PATH, --file PATH  Attach file content as context
+  -d PATH, --dir PATH   Attach directory tree and structure as context
+  -m NAME, --model NAME
+                        Gemini model identifier (default: gemini-3.5-flash-lite)
   -i, --interactive     Launch interactive wizard
   -w, --no-web          Disable web search grounding (pure LLM)
   -r, --raw             Output plain unformatted text

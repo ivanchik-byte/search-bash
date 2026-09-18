@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""
+Single-file terminal intelligence and search CLI tool.
+Zero external mandatory dependencies (uses Python stdlib).
+Optional enhanced rendering when 'rich' is available.
+"""
+
+import os
+import sys
+import json
+import re
+import time
+import hashlib
+import argparse
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+VERSION = "1.2.0"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-2.0-flash"
+
+CONFIG_DIR = Path.home() / ".config" / "search"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CACHE_DIR = Path.home() / ".cache" / "search_cli"
+CACHE_TTL = 3600 * 12
+
+MAX_STDIN_BYTES = 2 * 1024 * 1024
+MAX_FILE_BYTES = 1 * 1024 * 1024
+
+IGNORED_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "env",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
+    "build", "dist", "target", ".cache", ".next", ".nuxt", "vendor"
+}
+
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    HAS_RICH = True
+    console = Console()
+except ImportError:
+    HAS_RICH = False
+    console = None
+
+
+def load_config() -> dict:
+    cfg = {
+        "api_key": os.environ.get("GEMINI_API_KEY", "").strip(),
+        "model": os.environ.get("SEARCH_MODEL", DEFAULT_MODEL).strip(),
+        "default_site": "",
+    }
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if not cfg["api_key"] and saved.get("api_key"):
+                    cfg["api_key"] = saved["api_key"].strip()
+                if "model" in saved and not os.environ.get("SEARCH_MODEL"):
+                    cfg["model"] = saved["model"].strip()
+                if "default_site" in saved:
+                    cfg["default_site"] = saved["default_site"].strip()
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(api_key: str = None, model: str = None, default_site: str = None):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    current = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                current = json.load(f)
+        except Exception:
+            current = {}
+
+    if api_key is not None:
+        current["api_key"] = api_key.strip()
+    if model is not None:
+        current["model"] = model.strip()
+    if default_site is not None:
+        current["default_site"] = default_site.strip()
+
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2, ensure_ascii=False)
+
+
+def http_post_json(url: str, payload: dict, timeout: float = 30.0) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": f"search-cli/{VERSION}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        msg = f"HTTP {e.code}"
+        try:
+            err_json = json.loads(body)
+            if "error" in err_json and "message" in err_json["error"]:
+                msg = f"{msg}: {err_json['error']['message']}"
+            else:
+                msg = f"{msg}: {body}"
+        except Exception:
+            msg = f"{msg}: {body}"
+        raise RuntimeError(msg)
+    except Exception as e:
+        raise RuntimeError(f"Network error: {e}")
+
+
+def validate_api_key(api_key: str) -> tuple[bool, str]:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+        "generationConfig": {"maxOutputTokens": 1},
+    }
+    try:
+        http_post_json(url, payload, timeout=10.0)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def prompt_api_key() -> str:
+    print("[*] Gemini API key is not configured.")
+    print("    Get a free API key at: https://aistudio.google.com/app/apikey")
+
+    if not sys.stdin.isatty():
+        print("[-] Non-interactive environment. Set GEMINI_API_KEY or run 'search --set-key <KEY>'.", file=sys.stderr)
+        sys.exit(1)
+
+    while True:
+        try:
+            raw_key = input("\nEnter API key (or 'q' to quit): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(1)
+
+        if not raw_key or raw_key.lower() == "q":
+            print("Aborted.")
+            sys.exit(1)
+
+        print("[*] Validating key with Gemini API...")
+        valid, err = validate_api_key(raw_key)
+        if not valid:
+            print(f"[-] Key validation failed: {err}")
+            print("    Please verify your key and try again.")
+            continue
+
+        save_config(api_key=raw_key)
+        print("[+] Key verified and saved to ~/.config/search/config.json")
+        return raw_key
+
+
+def ensure_key() -> str:
+    cfg = load_config()
+    api_key = cfg.get("api_key", "").strip()
+    if not api_key:
+        api_key = prompt_api_key()
+    return api_key
+
+
+def clear_cache() -> int:
+    if not CACHE_DIR.exists():
+        return 0
+    count = 0
+    for p in CACHE_DIR.glob("*.json"):
+        try:
+            p.unlink()
+            count += 1
+        except Exception:
+            pass
+    return count
+
+
+def get_cache(key_str: str) -> dict | None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    q_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+    cache_file = CACHE_DIR / f"{q_hash}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if time.time() - data.get("timestamp", 0) < CACHE_TTL:
+                return data.get("result")
+        except Exception:
+            pass
+    return None
+
+
+def set_cache(key_str: str, result: dict):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        q_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+        cache_file = CACHE_DIR / f"{q_hash}.json"
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": time.time(), "result": result}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def read_piped_stdin() -> str:
+    if sys.stdin.isatty():
+        return ""
+    try:
+        raw_data = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+        if len(raw_data) > MAX_STDIN_BYTES:
+            print(f"[-] Warning: stdin truncated to {MAX_STDIN_BYTES // 1024 // 1024}MB.", file=sys.stderr)
+            raw_data = raw_data[:MAX_STDIN_BYTES]
+        return raw_data.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        print(f"[-] Warning: failed to read stdin: {e}", file=sys.stderr)
+        return ""
+
+
+def read_file_context(file_path: str) -> str:
+    p = Path(file_path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    size = p.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"File too large ({size // 1024}KB, max {MAX_FILE_BYTES // 1024}KB): {file_path}")
+    content = p.read_text(encoding="utf-8", errors="replace")
+    return f"File: {p.name}\nPath: {p}\n```\n{content}\n```"
+
+
+def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 150) -> str:
+    root = Path(dir_path).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Directory not found: {dir_path}")
+
+    tree_lines = [f"{root.name}/"]
+    file_count = 0
+    important_previews = []
+
+    def walk(current: Path, prefix: str, depth: int):
+        nonlocal file_count
+        if depth > max_depth or file_count >= max_files:
+            return
+
+        try:
+            entries = sorted(list(current.iterdir()), key=lambda x: (x.is_file(), x.name.lower()))
+        except PermissionError:
+            return
+
+        visible = [e for e in entries if e.name not in IGNORED_DIRS and not e.name.startswith(".")]
+
+        for idx, entry in enumerate(visible):
+            if file_count >= max_files:
+                tree_lines.append(f"{prefix}... (limit reached)")
+                break
+
+            is_last = idx == len(visible) - 1
+            connector = "\\-- " if is_last else "|-- "
+            sub_prefix = "    " if is_last else "|   "
+
+            if entry.is_dir():
+                tree_lines.append(f"{prefix}{connector}{entry.name}/")
+                walk(entry, prefix + sub_prefix, depth + 1)
+            else:
+                file_count += 1
+                tree_lines.append(f"{prefix}{connector}{entry.name}")
+                if entry.name.lower() in {
+                    "readme.md", "pyproject.toml", "package.json", "cargo.toml",
+                    "go.mod", "dockerfile", "docker-compose.yml", "makefile"
+                } and len(important_previews) < 2:
+                    try:
+                        content = entry.read_text(encoding="utf-8", errors="replace")[:1200]
+                        important_previews.append(f"--- Preview: {entry.name} ---\n{content}")
+                    except Exception:
+                        pass
+
+    walk(root, "", 1)
+
+    result = [
+        f"Directory Tree ({root}):",
+        "\n".join(tree_lines),
+        f"\nIndexed files: {file_count}"
+    ]
+    if important_previews:
+        result.append("\n" + "\n\n".join(important_previews))
+
+    return "\n".join(result)
+
+
+def extract_shell_command(text: str) -> str | None:
+    match = re.search(r"```(?:bash|sh|zsh)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if match:
+        cmd = match.group(1).strip()
+        if cmd and not cmd.startswith("#"):
+            return cmd
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("$ "):
+            return line[2:].strip()
+    return None
+
+
+def call_gemini(
+    prompt: str,
+    api_key: str,
+    model: str,
+    use_search: bool = True,
+    cmd_mode: bool = False,
+    site: str = None,
+) -> dict:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    if cmd_mode:
+        system_instruction = (
+            "You are a precise Linux/Unix command-line assistant. "
+            "Output the exact shell command inside a single markdown code block: ```bash\n<command>\n```. "
+            "Follow with a concise 1-2 sentence explanation. Avoid introductory filler."
+        )
+    else:
+        system_instruction = (
+            "You are a technical CLI assistant for developers and systems engineers. "
+            "Provide concise, practical, technical responses. "
+            "Use clear code blocks with language identifiers. Avoid conversational fluff and emojis."
+        )
+
+    augmented_prompt = prompt
+    if site:
+        augmented_prompt = f"Search specifically on site '{site}' if applicable.\n\nQuery: {prompt}"
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": augmented_prompt}],
+            }
+        ],
+        "systemInstruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "generationConfig": {
+            "temperature": 0.2 if cmd_mode else 0.4,
+            "maxOutputTokens": 3000,
+        },
+    }
+
+    if use_search:
+        payload["tools"] = [{"googleSearch": {}}]
+
+    try:
+        data = http_post_json(url, payload, timeout=30.0)
+    except RuntimeError as e:
+        if "HTTP 404" in str(e) and model != FALLBACK_MODEL:
+            return call_gemini(
+                prompt=prompt,
+                api_key=api_key,
+                model=FALLBACK_MODEL,
+                use_search=use_search,
+                cmd_mode=cmd_mode,
+                site=site,
+            )
+        raise e
+
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No response candidate returned by API.")
+
+    candidate = candidates[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    text_parts = [p.get("text", "") for p in parts if "text" in p]
+    answer_text = "".join(text_parts).strip()
+
+    grounding_meta = candidate.get("groundingMetadata", {})
+    queries = grounding_meta.get("webSearchQueries", [])
+    chunks = grounding_meta.get("groundingChunks", [])
+
+    sources = []
+    seen_urls = set()
+    for chunk in chunks:
+        web = chunk.get("web", {})
+        uri = web.get("uri")
+        title = web.get("title", uri)
+        if uri and uri not in seen_urls:
+            seen_urls.add(uri)
+            sources.append({"title": title, "url": uri})
+
+    suggested_cmd = extract_shell_command(answer_text) if cmd_mode else None
+
+    return {
+        "text": answer_text,
+        "suggested_cmd": suggested_cmd,
+        "queries": queries,
+        "sources": sources,
+        "model_used": model,
+    }
+
+
+def execute_shell_command(cmd: str):
+    print(f"\n[+] Executing: {cmd}")
+    try:
+        res = subprocess.run(cmd, shell=True)
+        if res.returncode != 0:
+            print(f"[-] Command exited with code: {res.returncode}", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] Execution error: {e}", file=sys.stderr)
+
+
+def render_output(result: dict, query_str: str, from_cache: bool, target_site: str, no_web: bool, model: str):
+    if HAS_RICH:
+        cache_notice = " [dim](cached)[/dim]" if from_cache else ""
+        site_notice = f" [cyan]• site:{target_site}[/cyan]" if target_site else ""
+        web_notice = " [green]• web[/green]" if not no_web else " [dim]• no-web[/dim]"
+        title = f"[bold white]{query_str or 'Analysis'}[/bold white]{site_notice}{web_notice}{cache_notice}"
+
+        console.print()
+        console.print(Panel(
+            Markdown(result["text"]),
+            title=title,
+            border_style="cyan",
+            subtitle=f"[dim]model: {result.get('model_used', model)}[/dim]",
+            subtitle_align="right",
+        ))
+
+        if result.get("sources"):
+            console.print("[bold cyan]Sources:[/bold cyan]")
+            for idx, s in enumerate(result["sources"][:5], 1):
+                console.print(f"  [{idx}] {s['title']}\n      [blue underline]{s['url']}[/blue underline]")
+        console.print()
+    else:
+        border = "=" * 60
+        print(f"\n{border}")
+        print(f"Results: {query_str or 'Analysis'} (model: {result.get('model_used', model)})")
+        print(f"{border}\n")
+        print(result["text"])
+        if result.get("sources"):
+            print("\nSources:")
+            for idx, s in enumerate(result["sources"][:5], 1):
+                print(f"  [{idx}] {s['title']} -> {s['url']}")
+        print()
+
+
+def run_interactive():
+    api_key = ensure_key()
+    cfg = load_config()
+
+    if HAS_RICH:
+        console.print(Panel(
+            f"[bold white]Search CLI[/bold white] [dim]v{VERSION}[/dim]\n"
+            "[dim]Terminal Intelligence with Google Search Grounding[/dim]",
+            border_style="cyan"
+        ))
+    else:
+        print(f"=== Search CLI v{VERSION} ===")
+
+    while True:
+        try:
+            prompt_str = "\nQuery (or 'q' to exit): "
+            query = console.input(f"[bold cyan]{prompt_str}[/bold cyan]").strip() if HAS_RICH else input(prompt_str).strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+        if not query or query.lower() in {"q", "exit", "quit"}:
+            break
+
+        default_site = cfg.get("default_site", "")
+        site_msg = f"Target domain (default: {default_site}): " if default_site else "Target domain (optional, e.g. stackoverflow.com): "
+        site_in = (console.input(f"[dim]{site_msg}[/dim]") if HAS_RICH else input(site_msg)).strip()
+        target_site = site_in if site_in else default_site
+
+        ctx_msg = "File or dir context (optional, press Enter to skip): "
+        ctx_in = (console.input(f"[dim]{ctx_msg}[/dim]") if HAS_RICH else input(ctx_msg)).strip()
+        context_data = ""
+        if ctx_in:
+            ctx_path = Path(ctx_in).expanduser()
+            if ctx_path.is_file():
+                try:
+                    context_data = read_file_context(str(ctx_path))
+                except Exception as e:
+                    print(f"[-] File error: {e}")
+            elif ctx_path.is_dir():
+                try:
+                    context_data = scan_directory(str(ctx_path))
+                except Exception as e:
+                    print(f"[-] Directory error: {e}")
+            else:
+                print(f"[-] Path not found: {ctx_in}")
+
+        mode_msg = "Mode: [1] Search & Explain  [2] Shell Command Generator: "
+        mode_in = (console.input(f"[dim]{mode_msg}[/dim]") if HAS_RICH else input(mode_msg)).strip()
+        cmd_mode = mode_in == "2"
+
+        full_prompt = query
+        if context_data:
+            full_prompt = f"Context:\n{context_data}\n\nTask:\n{query}"
+
+        model = cfg.get("model", DEFAULT_MODEL)
+        label = "Generating command..." if cmd_mode else f"Searching ({model})..."
+
+        try:
+            if HAS_RICH:
+                with console.status(f"[bold cyan]{label}[/bold cyan]", spinner="dots"):
+                    result = call_gemini(
+                        prompt=full_prompt,
+                        api_key=api_key,
+                        model=model,
+                        use_search=True,
+                        cmd_mode=cmd_mode,
+                        site=target_site or None,
+                    )
+            else:
+                print(f"[*] {label}")
+                result = call_gemini(
+                    prompt=full_prompt,
+                    api_key=api_key,
+                    model=model,
+                    use_search=True,
+                    cmd_mode=cmd_mode,
+                    site=target_site or None,
+                )
+        except Exception as e:
+            print(f"[-] API error: {e}")
+            continue
+
+        render_output(result, query, False, target_site, False, model)
+
+        suggested_cmd = result.get("suggested_cmd")
+        if suggested_cmd and sys.stdin.isatty():
+            try:
+                choice = input("Execute suggested command? [y/N/e(dit)]: ").strip().lower()
+                if choice == "y":
+                    execute_shell_command(suggested_cmd)
+                elif choice == "e":
+                    edited = input("Edit command: ").strip()
+                    if edited:
+                        execute_shell_command(edited)
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="search",
+        description="Terminal search, codebase inspection, and command-line AI assistant.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  search "how to configure reverse proxy in nginx"
+  search -c "find files larger than 50MB and sort by size"
+  search -s stackoverflow.com "python typeerror unhashable type"
+  search -f ./nginx.conf "explain ssl configuration"
+  search -d . "summarize project architecture"
+  cat /var/log/syslog | search "identify root cause"
+  search --set-key AIzaSy...
+"""
+    )
+    parser.add_argument("query", nargs="*", help="Query or prompt to process")
+    parser.add_argument("-c", "--cmd", action="store_true", help="Generate an executable shell command")
+    parser.add_argument("-s", "--site", metavar="DOMAIN", help="Scope search to a specific domain (e.g. stackoverflow.com)")
+    parser.add_argument("-f", "--file", metavar="PATH", help="Attach file content as context")
+    parser.add_argument("-d", "--dir", metavar="PATH", help="Attach directory tree and structure as context")
+    parser.add_argument("-m", "--model", metavar="NAME", help=f"Gemini model identifier (default: {DEFAULT_MODEL})")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive wizard/prompt")
+    parser.add_argument("-w", "--no-web", action="store_true", help="Disable web search grounding")
+    parser.add_argument("-r", "--raw", action="store_true", help="Output plain unformatted text")
+    parser.add_argument("-y", "--yes", action="store_true", help="Auto-execute generated command without confirmation")
+    parser.add_argument("--no-cache", action="store_true", help="Bypass local cache")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear local cache")
+    parser.add_argument("--set-key", metavar="KEY", help="Save API key to configuration")
+    parser.add_argument("--set-model", metavar="MODEL", help="Save default model to configuration")
+    parser.add_argument("--set-site", metavar="DOMAIN", help="Save default search domain to configuration")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
+
+    args = parser.parse_args()
+
+    if args.clear_cache:
+        cleared = clear_cache()
+        print(f"[+] Cache cleared ({cleared} records removed).")
+        return
+
+    if args.set_key:
+        valid, err = validate_api_key(args.set_key)
+        if not valid:
+            print(f"[-] Key validation failed: {err}", file=sys.stderr)
+            sys.exit(1)
+        save_config(api_key=args.set_key)
+        print("[+] API key validated and saved successfully.")
+        return
+
+    if args.set_model:
+        save_config(model=args.set_model)
+        print(f"[+] Default model set to: {args.set_model}")
+        return
+
+    if args.set_site:
+        save_config(default_site=args.set_site)
+        print(f"[+] Default search domain set to: {args.set_site}")
+        return
+
+    piped_data = read_piped_stdin()
+    query_str = " ".join(args.query).strip()
+
+    if args.interactive or (not query_str and not piped_data):
+        if not sys.stdin.isatty():
+            parser.print_help()
+            sys.exit(0)
+        run_interactive()
+        return
+
+    api_key = ensure_key()
+    cfg = load_config()
+    model = args.model or cfg.get("model", DEFAULT_MODEL)
+    target_site = args.site or cfg.get("default_site", "")
+
+    contexts = []
+    if piped_data:
+        contexts.append(f"Input Stream / Log:\n```\n{piped_data}\n```")
+
+    if args.file:
+        try:
+            contexts.append(read_file_context(args.file))
+        except Exception as e:
+            print(f"[-] File error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.dir:
+        try:
+            contexts.append(scan_directory(args.dir))
+        except Exception as e:
+            print(f"[-] Directory error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if contexts and query_str:
+        full_prompt = f"Context:\n" + "\n\n".join(contexts) + f"\n\nRequest:\n{query_str}"
+    elif contexts and not query_str:
+        full_prompt = (
+            "Analyze the provided context data. Identify any errors, warnings, or anomalies, "
+            "explain root causes, and provide actionable next steps and commands:\n\n" + "\n\n".join(contexts)
+        )
+    else:
+        full_prompt = query_str
+
+    cache_key = f"{model}:{not args.no_web}:{args.cmd}:{target_site}:{full_prompt}"
+    from_cache = False
+    result = None
+
+    if not args.no_cache:
+        cached_result = get_cache(cache_key)
+        if cached_result:
+            result = cached_result
+            from_cache = True
+
+    if result is None:
+        use_search = not args.no_web
+        status_label = "Generating command..." if args.cmd else f"Querying ({model})..."
+
+        try:
+            if HAS_RICH and not args.raw:
+                with console.status(f"[bold cyan]{status_label}[/bold cyan]", spinner="dots"):
+                    result = call_gemini(
+                        prompt=full_prompt,
+                        api_key=api_key,
+                        model=model,
+                        use_search=use_search,
+                        cmd_mode=args.cmd,
+                        site=target_site or None,
+                    )
+            else:
+                if not args.raw:
+                    print(f"[*] {status_label}")
+                result = call_gemini(
+                    prompt=full_prompt,
+                    api_key=api_key,
+                    model=model,
+                    use_search=use_search,
+                    cmd_mode=args.cmd,
+                    site=target_site or None,
+                )
+            set_cache(cache_key, result)
+        except Exception as e:
+            print(f"[-] Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.raw:
+        if args.cmd and result.get("suggested_cmd"):
+            print(result["suggested_cmd"])
+        else:
+            print(result["text"])
+        return
+
+    render_output(result, query_str, from_cache, target_site, args.no_web, model)
+
+    suggested_cmd = result.get("suggested_cmd")
+    if args.cmd and suggested_cmd:
+        if args.yes:
+            execute_shell_command(suggested_cmd)
+        elif sys.stdin.isatty():
+            try:
+                choice = input("Execute command? [y/N]: ").strip().lower()
+                if choice == "y":
+                    execute_shell_command(suggested_cmd)
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+
+if __name__ == "__main__":
+    main()
