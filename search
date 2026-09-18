@@ -16,12 +16,14 @@ import subprocess
 import urllib.request
 import urllib.error
 import threading
+import getpass
+import glob
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.1.1"
 
 class PipxSpinner:
-    """Braille dots spinner mimicking pipx and modern terminal animation."""
+    # Braille dots spinner for clean CLI loading feedback
     FRAMES = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"]
 
     def __init__(self, message="Processing..."):
@@ -37,10 +39,12 @@ class PipxSpinner:
             sys.stdout.flush()
             idx += 1
             time.sleep(0.08)
+        # Clear spinner line on completion
         sys.stdout.write("\r\033[K")
         sys.stdout.flush()
 
     def __enter__(self):
+        # Don't spin if output is redirected or piped
         if sys.stdout.isatty():
             self.thread = threading.Thread(target=self._spin, daemon=True)
             self.thread.start()
@@ -53,19 +57,25 @@ class PipxSpinner:
             self.stop_event.set()
             self.thread.join()
 
+# Config and cache storage paths
 CONFIG_DIR = Path.home() / ".config" / "search"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "search_cli"
-CACHE_TTL = 3600 * 12
+CACHE_TTL = 3600 * 12  # 12 hours cache lifetime for search results
 
+# Safety caps to avoid blowing past LLM context budgets
 MAX_STDIN_BYTES = 2 * 1024 * 1024
 MAX_FILE_BYTES = 1 * 1024 * 1024
 
+# Heavy folders collapsed to a single size summary during tree scan
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "env",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".idea", ".vscode",
     "build", "dist", "target", ".cache", ".next", ".nuxt", "vendor"
 }
+
+# Remember recent scan candidates for 1-10 numeric inspection
+LAST_SCANNED_CANDIDATES: list[str] = []
 
 PROVIDERS = {
     "gemini": {
@@ -95,6 +105,7 @@ PROVIDERS = {
     },
 }
 
+# Rich is optional; fallback to plain ANSI if not installed
 try:
     from rich.console import Console
     from rich.markdown import Markdown
@@ -116,6 +127,7 @@ def load_config() -> dict:
         "keys": {},
         "models": {},
     }
+    # Load stored json settings if file exists
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -124,6 +136,7 @@ def load_config() -> dict:
         except Exception:
             pass
 
+    # Environment variables take precedence over config file
     env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if env_key and not cfg.get("api_key"):
         cfg["api_key"] = env_key.strip()
@@ -135,6 +148,7 @@ def load_config() -> dict:
     provider = cfg.get("provider", "gemini")
     p_meta = PROVIDERS.get(provider, PROVIDERS["gemini"])
 
+    # Fill defaults for provider if not customized
     if not cfg.get("model"):
         cfg["model"] = cfg.get("models", {}).get(provider) or p_meta["default_model"]
     if not cfg.get("base_url"):
@@ -146,7 +160,12 @@ def load_config() -> dict:
 
 
 def save_config(provider: str = None, api_key: str = None, model: str = None, base_url: str = None, default_site: str = None):
+    # Lock down directory permissions (rwx------)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except Exception:
+        pass
     current = load_config()
 
     if provider is not None:
@@ -158,6 +177,7 @@ def save_config(provider: str = None, api_key: str = None, model: str = None, ba
     if "models" not in current:
         current["models"] = {}
 
+    # Store credentials per-provider so switching providers doesn't erase them
     if api_key is not None:
         current["api_key"] = api_key.strip()
         current["keys"][active_p] = api_key.strip()
@@ -171,8 +191,14 @@ def save_config(provider: str = None, api_key: str = None, model: str = None, ba
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(current, f, indent=2, ensure_ascii=False)
+    # File restricted to owner read/write (rw-------)
+    try:
+        CONFIG_FILE.chmod(0o600)
+    except Exception:
+        pass
 
 
+# Minimal HTTP client using standard urllib to avoid third-party dependencies
 def http_request(url: str, method: str = "GET", data: dict = None, headers: dict = None, timeout: float = 60.0) -> dict:
     h = {"User-Agent": f"search-cli/{VERSION}"}
     if headers:
@@ -188,7 +214,10 @@ def http_request(url: str, method: str = "GET", data: dict = None, headers: dict
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
+        # Scrub API keys so they never leak into error logs
+        raw = re.sub(r"key=[A-Za-z0-9_\-\.]+", "key=[REDACTED]", raw)
         msg = f"HTTP {e.code}"
+        # Extract provider-specific error message if available
         try:
             err_json = json.loads(raw)
             if "error" in err_json:
@@ -203,12 +232,13 @@ def http_request(url: str, method: str = "GET", data: dict = None, headers: dict
             msg = f"{msg}: {raw}"
         raise RuntimeError(msg)
     except Exception as e:
-        err_str = str(e)
+        err_str = re.sub(r"key=[A-Za-z0-9_\-\.]+", "key=[REDACTED]", str(e))
         if "timed out" in err_str.lower():
             err_str = f"{err_str} (server response exceeded timeout of {int(timeout)}s)"
         raise RuntimeError(f"Network error: {err_str}")
 
 
+# Quick probe to test key before saving to config
 def validate_provider_key(provider: str, api_key: str, base_url: str = None) -> tuple[bool, str]:
     if not base_url:
         base_url = PROVIDERS.get(provider, {}).get("base_url", "")
@@ -229,6 +259,7 @@ def validate_provider_key(provider: str, api_key: str, base_url: str = None) -> 
         return False, str(e)
 
 
+# First-run or manual interactive setup wizard
 def prompt_setup() -> dict:
     print("\n=== Search CLI Setup ===")
     print("Select API Provider:")
@@ -257,7 +288,8 @@ def prompt_setup() -> dict:
 
     while True:
         try:
-            raw_key = input(f"Enter {p_info['name']} API key: ").strip()
+            # getpass keeps key hidden from screen and bash history
+            raw_key = getpass.getpass(f"Enter {p_info['name']} API key (input hidden): ").strip().strip("'\"")
         except (KeyboardInterrupt, EOFError):
             print("\nAborted.")
             sys.exit(1)
@@ -305,6 +337,7 @@ def ensure_key() -> dict:
     return cfg
 
 
+# Wipe cached query responses from ~/.cache/search_cli
 def clear_cache() -> int:
     if not CACHE_DIR.exists():
         return 0
@@ -318,6 +351,7 @@ def clear_cache() -> int:
     return count
 
 
+# Look up cached response using sha256 of the prompt and options
 def get_cache(key_str: str) -> dict | None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     q_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
@@ -344,6 +378,7 @@ def set_cache(key_str: str, result: dict):
         pass
 
 
+# Slurp stdin only if data is actually piped (avoids blocking interactive runs)
 def read_piped_stdin() -> str:
     if sys.stdin.isatty():
         return ""
@@ -358,28 +393,118 @@ def read_piped_stdin() -> str:
         return ""
 
 
-def read_file_context(file_path: str) -> str:
-    p = Path(file_path).expanduser().resolve()
+# Convert raw bytes into readable sizes (KB, MB, GB)
+def format_size(size_bytes: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(size_bytes) < 1024.0 or unit == "TB":
+            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} PB"
+
+
+# Show file modification date plus relative age (e.g. 2h ago, 5d ago)
+def format_mtime(timestamp: float) -> str:
+    dt = time.localtime(timestamp)
+    date_str = time.strftime("%Y-%m-%d", dt)
+    diff_sec = time.time() - timestamp
+    if diff_sec < 3600:
+        age_str = f"{int(diff_sec // 60)}m ago" if diff_sec >= 60 else "just now"
+    elif diff_sec < 86400:
+        age_str = f"{int(diff_sec // 3600)}h ago"
+    else:
+        days = int(diff_sec // 86400)
+        age_str = f"{days}d ago"
+    return f"{date_str} ({age_str})"
+
+
+# Sum up folder size without listing every child file
+def get_dir_summary(path: Path) -> tuple[int, int]:
+    total_size = 0
+    total_count = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    fp = os.path.join(root, f)
+                    total_size += os.path.getsize(fp)
+                    total_count += 1
+                except (OSError, PermissionError):
+                    pass
+    except Exception:
+        pass
+    return total_size, total_count
+
+
+# Null bytes signal binary content; skip to protect LLM context
+def is_binary_file(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(1024)
+            return b"\x00" in chunk
+    except Exception:
+        return False
+
+
+# Read file with size limits; auto-tails logs or samples head of large files
+def read_file_context(file_spec: str | Path, max_sample_bytes: int = MAX_FILE_BYTES) -> str:
+    raw_spec = str(file_spec)
+    slice_mode = None
+    slice_lines = 100
+
+    # Parse optional slice syntax like file.log:tail:50
+    if ":" in raw_spec and not Path(raw_spec).exists():
+        parts = raw_spec.split(":")
+        raw_spec = parts[0]
+        slice_mode = parts[1].lower()
+        if len(parts) > 2 and parts[2].isdigit():
+            slice_lines = int(parts[2])
+
+    p = Path(raw_spec).expanduser().resolve()
     if not p.exists() or not p.is_file():
-        raise FileNotFoundError(f"File not found: {file_path}")
+        raise FileNotFoundError(f"File not found: {raw_spec}")
+
     size = p.stat().st_size
-    if size > MAX_FILE_BYTES:
-        raise ValueError(f"File too large ({size // 1024}KB, max {MAX_FILE_BYTES // 1024}KB): {file_path}")
+    mtime = p.stat().st_mtime
+    meta_info = f"File: {p.name} | Size: {format_size(size)} | Mod: {format_mtime(mtime)}\nPath: {p}"
+
+    if is_binary_file(p):
+        return f"{meta_info}\n[Binary file - preview omitted]"
+
+    # For logs, the tail has the crash info we actually care about
+    is_log = p.suffix.lower() in {".log", ".out", ".err", ".trace", ".dump"}
+    if slice_mode == "tail" or (is_log and size > max_sample_bytes):
+        with open(p, "rb") as f:
+            read_bytes = min(size, 64 * 1024)
+            f.seek(max(0, size - read_bytes))
+            content = f.read().decode("utf-8", errors="replace")
+            lines = content.splitlines()[-slice_lines:]
+            content = "\n".join(lines)
+        return f"{meta_info} (Sampled TAIL: last {len(lines)} lines):\n```\n{content}\n```"
+
+    # For big text files, take head to stay within prompt budget
+    if size > max_sample_bytes:
+        with open(p, "rb") as f:
+            content = f.read(max_sample_bytes).decode("utf-8", errors="replace")
+        return f"{meta_info} (Sampled HEAD: first {max_sample_bytes // 1024}KB):\n```\n{content}\n```"
+
     content = p.read_text(encoding="utf-8", errors="replace")
-    return f"File: {p.name}\nPath: {p}\n```\n{content}\n```"
+    return f"{meta_info}\n```\n{content}\n```"
 
 
-def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 150) -> str:
+# Recursive directory tree generator with size and age metadata
+def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 200) -> str:
     root = Path(dir_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Directory not found: {dir_path}")
 
+    all_files: list[dict] = []
     tree_lines = [f"{root.name}/"]
     file_count = 0
+    total_scanned_bytes = 0
     important_previews = []
 
     def walk(current: Path, prefix: str, depth: int):
-        nonlocal file_count
+        nonlocal file_count, total_scanned_bytes
         if depth > max_depth or file_count >= max_files:
             return
 
@@ -388,11 +513,12 @@ def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 150) -> s
         except PermissionError:
             return
 
-        visible = [e for e in entries if e.name not in IGNORED_DIRS and not e.name.startswith(".")]
+        # Skip hidden files and dot-folders by default
+        visible = [e for e in entries if not e.name.startswith(".")]
 
         for idx, entry in enumerate(visible):
             if file_count >= max_files:
-                tree_lines.append(f"{prefix}... (limit reached)")
+                tree_lines.append(f"{prefix}... [limit of {max_files} files reached]")
                 break
 
             is_last = idx == len(visible) - 1
@@ -400,11 +526,38 @@ def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 150) -> s
             sub_prefix = "    " if is_last else "|   "
 
             if entry.is_dir():
+                # Summarize heavy dependency directories instead of traversing
+                if entry.name in IGNORED_DIRS:
+                    d_size, d_cnt = get_dir_summary(entry)
+                    tree_lines.append(f"{prefix}{connector}{entry.name}/ [{format_size(d_size)} | {d_cnt} files (collapsed)]")
+                    total_scanned_bytes += d_size
+                    continue
+
                 tree_lines.append(f"{prefix}{connector}{entry.name}/")
                 walk(entry, prefix + sub_prefix, depth + 1)
             else:
+                try:
+                    st = entry.stat()
+                    size = st.st_size
+                    mtime = st.st_mtime
+                except OSError:
+                    size, mtime = 0, 0
+
                 file_count += 1
-                tree_lines.append(f"{prefix}{connector}{entry.name}")
+                total_scanned_bytes += size
+                rel_path = str(entry.relative_to(root)) if entry.is_relative_to(root) else entry.name
+                all_files.append({
+                    "path": rel_path,
+                    "full_path": str(entry),
+                    "size": size,
+                    "mtime": mtime,
+                    "name": entry.name
+                })
+
+                size_meta = f"[{format_size(size)} | {format_mtime(mtime)}]"
+                tree_lines.append(f"{prefix}{connector}{entry.name} {size_meta}")
+
+                # Peek at primary project files for context
                 if entry.name.lower() in {
                     "readme.md", "pyproject.toml", "package.json", "cargo.toml",
                     "go.mod", "dockerfile", "docker-compose.yml", "makefile"
@@ -417,17 +570,58 @@ def scan_directory(dir_path: str, max_depth: int = 3, max_files: int = 150) -> s
 
     walk(root, "", 1)
 
-    result = [
-        f"Directory Tree ({root}):",
-        "\n".join(tree_lines),
-        f"\nIndexed files: {file_count}"
+    # Sort largest files so the LLM spots cleanup targets right away
+    top_files = sorted(all_files, key=lambda x: x["size"], reverse=True)[:10]
+    for f in top_files:
+        if f["full_path"] not in LAST_SCANNED_CANDIDATES:
+            LAST_SCANNED_CANDIDATES.append(f["full_path"])
+    top_summary = []
+    for rank, f in enumerate(top_files, 1):
+        top_summary.append(
+            f"  [{rank:2d}] {format_size(f['size']):>10} | {format_mtime(f['mtime'])} | {f['path']}"
+        )
+
+    header = [
+        f"Directory: {root}",
+        f"Total Size: {format_size(total_scanned_bytes)} across {file_count} files (scanned depth: {max_depth})",
+        "\nTOP LARGEST FILES (Candidates for inspection / cleanup):",
+        "\n".join(top_summary) if top_summary else "  (None)",
+        "\nDirectory Tree:",
+        "\n".join(tree_lines)
     ]
     if important_previews:
-        result.append("\n" + "\n\n".join(important_previews))
+        header.append("\n" + "\n\n".join(important_previews))
 
-    return "\n".join(result)
+    return "\n".join(header)
 
 
+# Expand globs (*.log) and comma-separated file arguments
+def resolve_file_patterns(patterns: list[str]) -> list[Path]:
+    resolved = []
+    seen = set()
+    for item in patterns:
+        parts = [p.strip() for p in item.split(",") if p.strip()]
+        for p_str in parts:
+            if any(char in p_str for char in ["*", "?", "["]):
+                matched = glob.glob(os.path.expanduser(p_str), recursive=True)
+                for m in sorted(matched):
+                    path = Path(m).resolve()
+                    if path.is_file() and str(path) not in seen:
+                        seen.add(str(path))
+                        resolved.append(path)
+            else:
+                path = Path(p_str).expanduser().resolve()
+                if path.is_file() and str(path) not in seen:
+                    seen.add(str(path))
+                    resolved.append(path)
+                elif path.is_dir():
+                    print(f"[-] Note: '{p_str}' is a directory. Use -d/--dir for directory scanning.", file=sys.stderr)
+                else:
+                    print(f"[-] Warning: file '{p_str}' not found.", file=sys.stderr)
+    return resolved
+
+
+# Pull out runnable shell command from markdown blocks or $ prefix
 def extract_shell_command(text: str) -> str | None:
     match = re.search(r"```(?:bash|sh|zsh)?\s*\n(.*?)\n```", text, re.DOTALL)
     if match:
@@ -441,6 +635,7 @@ def extract_shell_command(text: str) -> str | None:
     return None
 
 
+# Dispatch prompt to configured backend (Gemini or OpenAI-compatible)
 def call_llm(
     prompt: str,
     cfg: dict,
@@ -458,12 +653,22 @@ def call_llm(
         sys_msg = (
             "You are a precise Linux/Unix command-line assistant. "
             "Output the exact shell command inside a single markdown code block: ```bash\n<command>\n```. "
-            "Follow with a concise 1-2 sentence explanation. Avoid introductory filler."
+            "Follow with a concise 1-2 sentence explanation. Avoid introductory filler. "
+            "When suggesting file deletion, provide safe commands (e.g. check before rm, or prefer trash-put/gio trash)."
         )
     else:
         sys_msg = (
             "You are a technical CLI assistant for developers and systems engineers. "
-            "Provide concise, practical, technical responses with code blocks. "
+            "Provide concise, direct, and accurate responses. "
+            "Use code blocks for commands, code snippets, or configuration examples only when relevant. "
+            "Do not force dummy code blocks for greetings or general questions. "
+            "When analyzing directories, codebase trees, or disk cleanup:\n"
+            "1. Categorize findings into:\n"
+            "   - Safe to delete immediately (old rotated logs, build artifacts, temporary caches, stale dumps).\n"
+            "   - Needs inspection first ('Let me inspect this' / 'Дай мне посмотреть' - e.g. unknown configs, loose scripts, untracked data).\n"
+            "   - Dangerous / preserve (source code, active configurations, database files).\n"
+            "2. Justify recommendations using file sizes and ages.\n"
+            "3. If uncertain about a file, explicitly advise inspecting it before deletion, referencing its path or candidate number.\n"
             "Avoid conversational fluff and emojis."
         )
 
@@ -471,6 +676,7 @@ def call_llm(
     if site:
         augmented_prompt = f"Scope search/knowledge specifically to '{site}'.\n\nQuery: {prompt}"
 
+    # Google Gemini: URL auth + googleSearch tool grounding
     if provider == "gemini":
         url = f"{base_url}/models/{target_model}:generateContent?key={api_key}"
         payload = {
@@ -498,6 +704,7 @@ def call_llm(
         text_parts = [p.get("text", "") for p in parts if "text" in p]
         answer_text = "".join(text_parts).strip()
 
+        # Parse Gemini search citations
         grounding_meta = candidates[0].get("groundingMetadata", {})
         queries = grounding_meta.get("webSearchQueries", [])
         chunks = grounding_meta.get("groundingChunks", [])
@@ -520,16 +727,11 @@ def call_llm(
         }
 
     else:
-        # OpenAI-compatible (OpenRouter, Nvidia NIM, Ollama, Custom)
+        # Standard OpenAI chat completions (OpenRouter, Nvidia NIM, Ollama)
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}"}
 
-        # OpenRouter web search support
         request_model = target_model
-        if provider == "openrouter" and use_search and not target_model.endswith(":online"):
-            # Can be used with :online suffix on OpenRouter
-            pass
-
         payload = {
             "model": request_model,
             "messages": [
@@ -548,7 +750,7 @@ def call_llm(
         msg = choices[0].get("message", {})
         answer_text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
-        # Extract citations / sources if available
+        # Extract citations if supported by the endpoint
         sources = []
         if "citations" in choices[0]:
             for c in choices[0]["citations"]:
@@ -563,6 +765,7 @@ def call_llm(
         }
 
 
+# Execute command after user confirmation
 def execute_shell_command(cmd: str):
     print(f"\n[+] Executing: {cmd}")
     try:
@@ -573,6 +776,7 @@ def execute_shell_command(cmd: str):
         print(f"[-] Execution error: {e}", file=sys.stderr)
 
 
+# Format Markdown response into a clean panel or plain text fallback
 def render_output(result: dict, query_str: str, from_cache: bool, target_site: str, no_web: bool, model: str, provider: str):
     if HAS_RICH:
         cache_notice = " [dim](cached)[/dim]" if from_cache else ""
@@ -607,6 +811,95 @@ def render_output(result: dict, query_str: str, from_cache: bool, target_site: s
         print()
 
 
+# Interactive loop: inspect file content and offer safe deletion
+def prompt_file_inspection(cfg: dict, model: str, provider: str, base_dirs: list[Path] | None = None):
+    if not sys.stdin.isatty():
+        return
+    while True:
+        try:
+            if LAST_SCANNED_CANDIDATES:
+                prompt_str = f"\nInspect file content? [1-{len(LAST_SCANNED_CANDIDATES)} or file path, Enter to finish]: "
+            else:
+                prompt_str = "\nInspect file content? [file path, Enter to finish]: "
+            target_str = console.input(f"[bold cyan]{prompt_str}[/bold cyan]").strip() if HAS_RICH else input(prompt_str).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        if not target_str or target_str.lower() in {"q", "quit", "exit", "n", "no"}:
+            break
+
+        clean_path_str = target_str.split()[0].strip("'\"")
+        # Check if user typed a candidate rank number (e.g. 1 or #1)
+        num_str = clean_path_str.lstrip("#")
+        if num_str.isdigit():
+            idx = int(num_str)
+            if 1 <= idx <= len(LAST_SCANNED_CANDIDATES):
+                clean_path_str = LAST_SCANNED_CANDIDATES[idx - 1]
+            else:
+                print(f"[-] Invalid candidate number: {idx}. Choose 1-{len(LAST_SCANNED_CANDIDATES)}")
+                continue
+
+        target_path = Path(clean_path_str).expanduser()
+        # Resolve relative path inside scanned folder if not found in cwd
+        if not target_path.is_absolute() and not target_path.exists() and base_dirs:
+            for b in base_dirs:
+                candidate = (b / target_path).resolve()
+                if candidate.exists():
+                    target_path = candidate
+                    break
+        target_path = target_path.resolve()
+        if not target_path.exists():
+            print(f"[-] File not found: {clean_path_str}")
+            continue
+        if target_path.is_dir():
+            print(f"[-] '{clean_path_str}' is a directory. Specify a file path to inspect.")
+            continue
+
+        try:
+            file_ctx = read_file_context(target_path)
+        except Exception as e:
+            print(f"[-] Cannot read file: {e}")
+            continue
+
+        inspection_prompt = (
+            f"Context:\n{file_ctx}\n\n"
+            f"Task: Inspect this file ({target_path.name}). Summarize what it contains and its role. "
+            f"Determine if it is safe to delete or if it contains critical/active data. Provide a clear verdict."
+        )
+
+        try:
+            with PipxSpinner(f"Inspecting {target_path.name}..."):
+                res = call_llm(
+                    prompt=inspection_prompt,
+                    cfg=cfg,
+                    model=model,
+                    use_search=False,
+                    cmd_mode=False
+                )
+            render_output(res, f"File Inspection: {target_path.name}", False, "", True, model, provider)
+        except Exception as e:
+            print(f"[-] Inspection error: {e}")
+            continue
+
+        # Ask user before removing; favor trash utilities over permanent rm
+        try:
+            del_choice = input(f"Delete '{target_path.name}'? [y/N]: ").strip().lower()
+            if del_choice == "y":
+                if subprocess.run("which trash-put >/dev/null 2>&1", shell=True).returncode == 0:
+                    subprocess.run(["trash-put", str(target_path)])
+                    print(f"[+] Moved to trash: {target_path.name}")
+                elif subprocess.run("which gio >/dev/null 2>&1", shell=True).returncode == 0:
+                    subprocess.run(["gio", "trash", str(target_path)])
+                    print(f"[+] Moved to trash: {target_path.name}")
+                else:
+                    target_path.unlink()
+                    print(f"[+] Deleted: {target_path.name}")
+        except Exception as e:
+            print(f"[-] Deletion error: {e}")
+
+
+# Interactive REPL session
 def run_interactive():
     cfg = ensure_key()
     provider = cfg.get("provider", "gemini")
@@ -694,6 +987,9 @@ def run_interactive():
             except (KeyboardInterrupt, EOFError):
                 pass
 
+        if context_data and sys.stdin.isatty():
+            prompt_file_inspection(cfg, model, provider)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -717,8 +1013,9 @@ def main():
     parser.add_argument("-p", "--provider", choices=["gemini", "openrouter", "nvidia", "custom"], help="AI provider")
     parser.add_argument("-m", "--model", metavar="NAME", help="Model identifier")
     parser.add_argument("-s", "--site", metavar="DOMAIN", help="Scope search to a specific domain")
-    parser.add_argument("-f", "--file", metavar="PATH", help="Attach file content as context")
-    parser.add_argument("-d", "--dir", metavar="PATH", help="Attach directory tree and structure as context")
+    parser.add_argument("-f", "--file", action="append", default=[], metavar="PATH", help="Attach file(s) or glob pattern (e.g. '*.log') as context (can be repeated)")
+    parser.add_argument("-d", "--dir", action="append", default=[], metavar="PATH", help="Attach directory tree(s) as context (can be repeated)")
+    parser.add_argument("-a", "--all-files", "--cwd", action="store_true", help="Attach current directory overview as context")
     parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive wizard/prompt")
     parser.add_argument("-w", "--no-web", action="store_true", help="Disable web search grounding")
     parser.add_argument("-r", "--raw", action="store_true", help="Output plain unformatted text")
@@ -727,7 +1024,7 @@ def main():
     parser.add_argument("--no-cache", action="store_true", help="Bypass local cache")
     parser.add_argument("--clear-cache", action="store_true", help="Clear local cache")
     parser.add_argument("--set-provider", choices=["gemini", "openrouter", "nvidia", "custom"], help="Set default provider")
-    parser.add_argument("--set-key", metavar="KEY", help="Save API key for active provider")
+    parser.add_argument("--set-key", metavar="KEY", nargs="?", const="", help="Save API key (prompts securely without echo if KEY is omitted)")
     parser.add_argument("--set-model", metavar="MODEL", help="Save default model for active provider")
     parser.add_argument("--set-url", metavar="URL", help="Save custom Base URL")
     parser.add_argument("--set-site", metavar="DOMAIN", help="Save default search domain")
@@ -765,23 +1062,40 @@ def main():
         print(f"[+] Default search domain set to: {args.set_site}")
         return
 
-    if args.set_key:
+    # Save API key; prompts with getpass if argument was omitted
+    if args.set_key is not None:
         cfg = load_config()
         prov = args.provider or cfg.get("provider", "gemini")
         b_url = args.set_url or cfg.get("base_url")
-        valid, err = validate_provider_key(prov, args.set_key, b_url)
+        key_val = args.set_key.strip().strip("'\"")
+        if not key_val:
+            if not sys.stdin.isatty():
+                print("[-] Cannot prompt in non-interactive environment. Provide KEY argument.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                key_val = getpass.getpass(f"Enter API key for {prov} (input hidden): ").strip().strip("'\"")
+            except (KeyboardInterrupt, EOFError):
+                print("\nAborted.")
+                sys.exit(1)
+            if not key_val:
+                print("[-] No key entered. Aborting.", file=sys.stderr)
+                sys.exit(1)
+
+        valid, err = validate_provider_key(prov, key_val, b_url)
         if not valid and not args.force:
             print(f"[-] Key validation failed for {prov}: {err}", file=sys.stderr)
             print("    Use --force to save the key anyway if your network requires a proxy/VPN.", file=sys.stderr)
             sys.exit(1)
-        save_config(provider=prov, api_key=args.set_key)
-        print(f"[+] API key saved for provider '{prov}'.")
+        save_config(provider=prov, api_key=key_val)
+        print(f"[+] API key saved securely for provider '{prov}'.")
         return
 
     piped_data = read_piped_stdin()
     query_str = " ".join(args.query).strip()
+    has_context_args = bool(args.file or args.dir or args.all_files)
 
-    if args.interactive or (not query_str and not piped_data):
+    # Launch interactive wizard when called with zero input or explicit -i
+    if args.interactive or (not query_str and not piped_data and not has_context_args):
         if not sys.stdin.isatty():
             parser.print_help()
             sys.exit(0)
@@ -800,34 +1114,69 @@ def main():
     provider = cfg.get("provider", "gemini")
     target_site = args.site or cfg.get("default_site", "")
 
+    # Gather context chunks from pipe, directories, and file globs
     contexts = []
+    active_dirs = []
     if piped_data:
         contexts.append(f"Input Stream / Log:\n```\n{piped_data}\n```")
 
-    if args.file:
+    if args.all_files:
+        active_dirs.append(Path(".").resolve())
         try:
-            contexts.append(read_file_context(args.file))
-        except Exception as e:
-            print(f"[-] File error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    if args.dir:
-        try:
-            contexts.append(scan_directory(args.dir))
+            contexts.append(scan_directory("."))
         except Exception as e:
             print(f"[-] Directory error: {e}", file=sys.stderr)
             sys.exit(1)
 
+    if args.dir:
+        for d_path in args.dir:
+            active_dirs.append(Path(d_path).expanduser().resolve())
+            try:
+                contexts.append(scan_directory(d_path))
+            except Exception as e:
+                print(f"[-] Directory error ({d_path}): {e}", file=sys.stderr)
+                sys.exit(1)
+
+    if args.file:
+        matched_files = resolve_file_patterns(args.file)
+        if not matched_files:
+            print("[-] No matching files found.", file=sys.stderr)
+            sys.exit(1)
+        for mf in matched_files:
+            if str(mf) not in LAST_SCANNED_CANDIDATES:
+                LAST_SCANNED_CANDIDATES.append(str(mf))
+        TOTAL_FILE_BUDGET = 2 * 1024 * 1024
+        used_bytes = 0
+        for f in matched_files:
+            if used_bytes >= TOTAL_FILE_BUDGET:
+                contexts.append(f"[-] {len(matched_files) - len(contexts)} remaining files omitted (context limit reached).")
+                break
+            try:
+                ctx = read_file_context(f)
+                contexts.append(ctx)
+                used_bytes += len(ctx.encode("utf-8"))
+            except Exception as e:
+                print(f"[-] File error ({f.name}): {e}", file=sys.stderr)
+
+    # Build prompt: if scanning dirs with no query, default to cleanup guidance
     if contexts and query_str:
         full_prompt = f"Context:\n" + "\n\n".join(contexts) + f"\n\nRequest:\n{query_str}"
     elif contexts and not query_str:
-        full_prompt = (
-            "Analyze the provided context data. Identify any errors, warnings, or anomalies, "
-            "explain root causes, and provide actionable next steps and commands:\n\n" + "\n\n".join(contexts)
-        )
+        if args.dir or args.all_files:
+            full_prompt = (
+                "Analyze this directory structure and top files. Summarize the contents, identify large files, "
+                "obsolete logs, caches, temporary files, or candidates for cleanup, and provide clear recommendations:\n\n"
+                + "\n\n".join(contexts)
+            )
+        else:
+            full_prompt = (
+                "Analyze the provided context data. Identify any errors, warnings, or anomalies, "
+                "explain root causes, and provide actionable next steps and commands:\n\n" + "\n\n".join(contexts)
+            )
     else:
         full_prompt = query_str
 
+    # Skip API request if response is already cached locally
     cache_key = f"{provider}:{model}:{not args.no_web}:{args.cmd}:{target_site}:{full_prompt}"
     from_cache = False
     result = None
@@ -876,6 +1225,7 @@ def main():
 
     render_output(result, query_str, from_cache, target_site, args.no_web, model, provider)
 
+    # Shell command execution prompt in -c mode
     suggested_cmd = result.get("suggested_cmd")
     if args.cmd and suggested_cmd:
         if args.yes:
@@ -887,6 +1237,10 @@ def main():
                     execute_shell_command(suggested_cmd)
             except (KeyboardInterrupt, EOFError):
                 pass
+
+    # Offer file inspection if context files or dirs were provided
+    if (args.dir or args.all_files or args.file) and sys.stdin.isatty():
+        prompt_file_inspection(cfg, model, provider, base_dirs=active_dirs)
 
 
 if __name__ == "__main__":

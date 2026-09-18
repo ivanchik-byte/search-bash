@@ -36,3 +36,12 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+# Secrets & Credentials
+*.key
+*.pem
+*.token
+*.env
+*.env.*
+config.json
+credentials.json
