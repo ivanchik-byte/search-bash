@@ -621,17 +621,39 @@ def resolve_file_patterns(patterns: list[str]) -> list[Path]:
     return resolved
 
 
-# Pull out runnable shell command from markdown blocks or $ prefix
+# Pull out runnable shell command from markdown blocks, inline code, or $ prefix
 def extract_shell_command(text: str) -> str | None:
-    match = re.search(r"```(?:bash|sh|zsh)?\s*\n(.*?)\n```", text, re.DOTALL)
+    # 1. Standard markdown code block: ```bash ... ```
+    match = re.search(r"```(?:bash|sh|zsh|shell)?\s*\n(.*?)\n```", text, re.DOTALL)
     if match:
         cmd = match.group(1).strip()
-        if cmd and not cmd.startswith("#"):
-            return cmd
+        active = [l for l in cmd.splitlines() if not l.strip().startswith("#")]
+        if active:
+            return "\n".join(active).strip()
+
+    # 2. Any code block without newline: ```bash ... ```
+    match = re.search(r"```(?:bash|sh|zsh|shell)?\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        cmd = match.group(1).strip()
+        active = [l for l in cmd.splitlines() if not l.strip().startswith("#")]
+        if active:
+            return "\n".join(active).strip()
+
+    # 3. Lines prefixed with $
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("$ "):
             return line[2:].strip()
+
+    # 4. Inline code block with common shell command
+    inline_matches = re.findall(r"`([^`\n]+)`", text)
+    common_verbs = {"rm", "gio", "trash-put", "find", "mv", "cp", "git", "docker", "ls", "cat", "sed", "awk", "tar", "grep", "curl", "chmod", "chown", "mkdir"}
+    for inline in inline_matches:
+        inline = inline.strip()
+        first_word = inline.split()[0] if inline.split() else ""
+        if first_word in common_verbs:
+            return inline
+
     return None
 
 
@@ -652,9 +674,13 @@ def call_llm(
     if cmd_mode:
         sys_msg = (
             "You are a precise Linux/Unix command-line assistant. "
-            "Output the exact shell command inside a single markdown code block: ```bash\n<command>\n```. "
-            "Follow with a concise 1-2 sentence explanation. Avoid introductory filler. "
-            "When suggesting file deletion, provide safe commands (e.g. check before rm, or prefer trash-put/gio trash)."
+            "Output the exact, ready-to-execute shell command inside a single markdown code block: ```bash\n<command>\n```. "
+            "Follow with a concise 1-sentence explanation. Avoid conversational filler. "
+            "Rules for commands:\n"
+            "- Must be a single runnable command or pipeline (never write interactive scripts with read -p).\n"
+            "- When deleting or modifying files in the current folder, target the current directory directly (e.g. 'rm -i ./*.png' or 'gio trash ./*.png').\n"
+            "- Never use fictional placeholders like '/path/to/your/file' when user refers to the current folder.\n"
+            "- Always use safe flags for deletion (such as -i for interactive confirmation before deleting each file)."
         )
     else:
         sys_msg = (
@@ -1174,7 +1200,23 @@ def main():
                 "explain root causes, and provide actionable next steps and commands:\n\n" + "\n\n".join(contexts)
             )
     else:
-        full_prompt = query_str
+        if args.cmd:
+            cwd = Path.cwd()
+            exts = re.findall(r"\.([a-zA-Z0-9_-]{1,8})\b", query_str)
+            found_files = []
+            for ext in exts:
+                try:
+                    for p in cwd.glob(f"*.{ext}"):
+                        if p.is_file():
+                            found_files.append(p.name)
+                except Exception:
+                    pass
+            dir_hint = f"Current working directory: {cwd}"
+            if found_files:
+                dir_hint += f"\nExisting matching files in this directory: {', '.join(found_files[:15])}"
+            full_prompt = f"{dir_hint}\n\nTask:\n{query_str}"
+        else:
+            full_prompt = query_str
 
     # Skip API request if response is already cached locally
     cache_key = f"{provider}:{model}:{not args.no_web}:{args.cmd}:{target_site}:{full_prompt}"
@@ -1232,11 +1274,19 @@ def main():
             execute_shell_command(suggested_cmd)
         elif sys.stdin.isatty():
             try:
-                choice = input("Execute command? [y/N]: ").strip().lower()
+                choice = input("Execute command? [y/N/e(dit)]: ").strip().lower()
                 if choice == "y":
                     execute_shell_command(suggested_cmd)
+                elif choice == "e":
+                    new_cmd = input(f"Edit command [{suggested_cmd}]: ").strip() or suggested_cmd
+                    execute_shell_command(new_cmd)
             except (KeyboardInterrupt, EOFError):
                 pass
+    elif args.cmd and not suggested_cmd:
+        if HAS_RICH:
+            console.print("[dim]Tip: You can attach files with -f <file> or inspect folders with -d .[/dim]")
+        else:
+            print("Tip: You can attach files with -f <file> or inspect folders with -d .")
 
     # Offer file inspection if context files or dirs were provided
     if (args.dir or args.all_files or args.file) and sys.stdin.isatty():
