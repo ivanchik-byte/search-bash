@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "search-bash"
+version = "1.1.1"
+description = "Fast standalone terminal search and AI assistant for Linux and macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "rich>=12.0.0",
+]
+
+[tool.setuptools]
+script-files = ["search"]

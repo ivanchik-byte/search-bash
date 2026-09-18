@@ -29,7 +29,22 @@ curl -fsSL https://raw.githubusercontent.com/ivanchik-byte/search-bash/main/inst
 ```
 
 <details>
-<summary>Другие варианты установки</summary>
+<summary>Другие варианты установки (pipx, npm, вручную)</summary>
+
+### pipx (изолированное окружение Python)
+```bash
+pipx install git+https://github.com/ivanchik-byte/search-bash.git
+```
+
+### npm / npx (Node.js)
+Установка глобально через npm:
+```bash
+npm install -g github:ivanchik-byte/search-bash
+```
+Либо разовый запуск через npx без установки:
+```bash
+npx github:ivanchik-byte/search-bash "how to configure nginx websocket"
+```
 
 ### Прямая загрузка
 ```bash

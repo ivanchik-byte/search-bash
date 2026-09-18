@@ -1,0 +1,22 @@
+{
+  "name": "search-bash",
+  "version": "1.1.1",
+  "description": "Fast standalone terminal search and AI assistant for Linux and macOS",
+  "main": "bin/search.js",
+  "bin": {
+    "search": "bin/search.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ivanchik-byte/search-bash.git"
+  },
+  "keywords": [
+    "cli",
+    "terminal",
+    "search",
+    "ai",
+    "gemini"
+  ],
+  "author": "Ivan",
+  "license": "MIT"
+}
