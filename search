@@ -173,7 +173,7 @@ def save_config(provider: str = None, api_key: str = None, model: str = None, ba
         json.dump(current, f, indent=2, ensure_ascii=False)
 
 
-def http_request(url: str, method: str = "GET", data: dict = None, headers: dict = None, timeout: float = 30.0) -> dict:
+def http_request(url: str, method: str = "GET", data: dict = None, headers: dict = None, timeout: float = 60.0) -> dict:
     h = {"User-Agent": f"search-cli/{VERSION}"}
     if headers:
         h.update(headers)
@@ -203,7 +203,10 @@ def http_request(url: str, method: str = "GET", data: dict = None, headers: dict
             msg = f"{msg}: {raw}"
         raise RuntimeError(msg)
     except Exception as e:
-        raise RuntimeError(f"Network error: {e}")
+        err_str = str(e)
+        if "timed out" in err_str.lower():
+            err_str = f"{err_str} (server response exceeded timeout of {int(timeout)}s)"
+        raise RuntimeError(f"Network error: {err_str}")
 
 
 def validate_provider_key(provider: str, api_key: str, base_url: str = None) -> tuple[bool, str]:
@@ -479,7 +482,7 @@ def call_llm(
             payload["tools"] = [{"googleSearch": {}}]
 
         try:
-            data = http_request(url, method="POST", data=payload, timeout=30.0)
+            data = http_request(url, method="POST", data=payload, timeout=60.0)
         except RuntimeError as e:
             fallback = PROVIDERS["gemini"].get("fallback_model")
             if "HTTP 404" in str(e) and fallback and target_model != fallback:
@@ -534,14 +537,16 @@ def call_llm(
                 {"role": "user", "content": augmented_prompt},
             ],
             "temperature": 0.2 if cmd_mode else 0.4,
+            "max_tokens": 2048,
         }
 
-        data = http_request(url, method="POST", data=payload, headers=headers, timeout=35.0)
+        data = http_request(url, method="POST", data=payload, headers=headers, timeout=60.0)
         choices = data.get("choices", [])
         if not choices:
             raise RuntimeError(f"No choices returned by {provider} API.")
 
-        answer_text = choices[0].get("message", {}).get("content", "").strip()
+        msg = choices[0].get("message", {})
+        answer_text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
         # Extract citations / sources if available
         sources = []
