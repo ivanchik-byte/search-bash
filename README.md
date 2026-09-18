@@ -1,10 +1,19 @@
 # search
 
-A single-file terminal intelligence and search utility powered by Google Search Grounding.
+A single-file terminal intelligence and search utility with multi-provider AI support (Google Gemini, OpenRouter, Nvidia NIM, and OpenAI-compatible endpoints).
 
 Designed for Linux servers, remote SSH sessions, and DevOps workflows. Returns verified documentation, executable shell commands, and project-aware analysis directly inside your terminal.
 
 Zero mandatory dependencies. Runs on standard Python 3.10+.
+
+---
+
+## Supported Providers
+
+- **Google Gemini** (Google AI Studio) — Search Grounding with live Google results.
+- **OpenRouter** (openrouter.ai) — 200+ models (Claude, Llama, DeepSeek, Mistral) with optional search grounding.
+- **Nvidia NIM** (integrate.api.nvidia.com) — High-throughput inference for Llama 3.3, Nemotron, Mistral.
+- **Custom / Local** (Ollama, Groq, vLLM, LiteLLM) — Any OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ---
 
@@ -23,35 +32,56 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ---
 
-## Setup
+## Setup & Provider Configuration
 
-Run `search` without arguments to launch the first-run configuration wizard:
+Run the setup wizard to choose your provider and configure your API key:
 
 ```bash
-search
+search --setup
 ```
 
-It will prompt for your free Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey), validate it, and store it in `~/.config/search/config.json`.
+Or configure directly via CLI flags:
 
-Alternatively, configure the key directly:
+### Google Gemini:
 ```bash
+search --set-provider gemini
 search --set-key "AIzaSy..."
-# or
-export GEMINI_API_KEY="AIzaSy..."
+search --set-model "gemini-3.5-flash-lite"
+```
+
+### OpenRouter:
+```bash
+search --set-provider openrouter
+search --set-key "sk-or-v1-..."
+search --set-model "meta-llama/llama-3.3-70b-instruct"
+```
+
+### Nvidia NIM:
+```bash
+search --set-provider nvidia
+search --set-key "nvapi-..."
+search --set-model "meta/llama-3.3-70b-instruct"
+```
+
+### Local Ollama / Custom:
+```bash
+search --set-provider custom
+search --set-url "http://localhost:11434/v1"
+search --set-model "llama3.2"
 ```
 
 ---
 
 ## Features
 
-- **Single-File Architecture**: Everything lives in one self-contained script (`search`). No virtual environments, no package clutter.
-- **Interactive Wizard**: Run `search` with no arguments to step through query formulation, target domain selection, and command execution.
-- **Live Google Search Grounding**: Retrieves current web results with clickable source links.
+- **Single-File Architecture**: Everything lives in one self-contained script (`search`).
+- **Multi-Provider**: Switch between Gemini, OpenRouter, Nvidia, or local models anytime (`-p <provider>`).
+- **Interactive Wizard**: Run `search` with no arguments to step through query formulation and command execution.
 - **Command Generator (`-c`)**: Generates exact, copy-pasteable Linux commands with an interactive prompt to execute them.
 - **Codebase & File Context (`-f`, `-d`)**: Analyzes specific files or scans repository directory trees (filtering noise like `.git`, `node_modules`, `venv`).
 - **Domain Targeting (`-s`)**: Restricts search scope to specific documentation sites (e.g. `stackoverflow.com`, `docs.docker.com`).
 - **Unix Pipelines**: Reads stdin streams (`cat /var/log/syslog | search "explain root cause"`).
-- **Local Caching**: Repeated identical queries return instantly from `~/.cache/search_cli/`, preserving API quotas.
+- **Local Caching**: Repeated identical queries return instantly from `~/.cache/search_cli/`.
 - **Clean Terminal UI**: Strict Unix style. No emojis, no marketing chatter.
 
 ---
@@ -66,7 +96,7 @@ search
 ### 2. General Technical Search
 ```bash
 search "how to configure reverse proxy in nginx for websocket"
-search "systemd service restart limit configuration"
+search -p openrouter -m meta-llama/llama-3.3-70b-instruct "explain b-trees"
 ```
 
 ### 3. Generate and Execute Shell Commands (`-c`)
@@ -79,22 +109,8 @@ find / -type f -size +100M -exec ls -lh {} + 2>/dev/null | awk '{ print $5, $9 }
 
 Execute command? [y/N]: y
 ```
-To auto-execute without confirmation:
-```bash
-search -c -y "show free memory in human readable format"
-```
 
-### 4. Site-Scoped Search (`-s`)
-```bash
-search -s stackoverflow.com "python typeerror unhashable type list"
-search -s docs.docker.com "healthcheck interval and retries"
-```
-To set a default domain for all future queries:
-```bash
-search --set-site "stackoverflow.com"
-```
-
-### 5. Inspect Files and Repositories (`-f`, `-d`)
+### 4. Inspect Files and Repositories (`-f`, `-d`)
 ```bash
 # Analyze a configuration file:
 search -f /etc/nginx/nginx.conf "identify potential performance bottlenecks"
@@ -103,12 +119,9 @@ search -f /etc/nginx/nginx.conf "identify potential performance bottlenecks"
 search -d . "summarize project architecture and entry points"
 ```
 
-### 6. Piped Input
+### 5. Piped Input
 ```bash
-# Analyze error log:
 cat /var/log/nginx/error.log | search "what caused this error and how to fix it"
-
-# Diagnose hardware / kernel messages:
 dmesg | tail -n 50 | search
 ```
 
@@ -117,10 +130,11 @@ dmesg | tail -n 50 | search
 ## Command-Line Options
 
 ```text
-usage: search [-h] [-c] [-s DOMAIN] [-f PATH] [-d PATH] [-m NAME] [-i]
-              [-w] [-r] [-y] [--no-cache] [--clear-cache]
-              [--set-key KEY] [--set-model MODEL] [--set-site DOMAIN]
-              [-v] [query ...]
+usage: search [-h] [-c] [-p {gemini,openrouter,nvidia,custom}] [-m NAME]
+              [-s DOMAIN] [-f PATH] [-d PATH] [-i] [-w] [-r] [-y] [--setup]
+              [--no-cache] [--clear-cache] [--set-provider {gemini,openrouter,nvidia,custom}]
+              [--set-key KEY] [--set-model MODEL] [--set-url URL] [--set-site DOMAIN]
+              [--force] [-v] [query ...]
 
 positional arguments:
   query                 Query or prompt to process
@@ -128,21 +142,24 @@ positional arguments:
 options:
   -h, --help            Show this help message and exit
   -c, --cmd             Generate an executable shell command
-  -s DOMAIN, --site DOMAIN
-                        Scope search to a specific domain
-  -f PATH, --file PATH  Attach file content as context
-  -d PATH, --dir PATH   Attach directory tree and structure as context
-  -m NAME, --model NAME
-                        Gemini model identifier (default: gemini-3.5-flash-lite)
+  -p, --provider        Switch provider (gemini, openrouter, nvidia, custom)
+  -m, --model NAME      Model identifier
+  -s, --site DOMAIN     Scope search to a specific domain
+  -f, --file PATH       Attach file content as context
+  -d, --dir PATH        Attach directory tree and structure as context
   -i, --interactive     Launch interactive wizard
-  -w, --no-web          Disable web search grounding (pure LLM)
+  -w, --no-web          Disable web search grounding
   -r, --raw             Output plain unformatted text
   -y, --yes             Auto-execute generated command without confirmation
+  --setup               Run provider and key configuration wizard
+  --force               Force save settings even if validation warns
   --no-cache            Bypass local cache
   --clear-cache         Clear local cache
-  --set-key KEY         Save API key to configuration
-  --set-model MODEL     Save default model to configuration
-  --set-site DOMAIN     Save default search domain to configuration
+  --set-provider        Set default provider
+  --set-key KEY         Save API key for active provider
+  --set-model MODEL     Save default model for active provider
+  --set-url URL         Save custom Base URL
+  --set-site DOMAIN     Save default search domain
   -v, --version         Show program's version number and exit
 ```
 

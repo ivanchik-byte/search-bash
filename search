@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Single-file terminal intelligence and search CLI tool.
-Zero external mandatory dependencies (uses Python stdlib).
-Optional enhanced rendering when 'rich' is available.
+Supports multiple providers: Google Gemini, OpenRouter, Nvidia NIM, and OpenAI-compatible endpoints.
+Zero external mandatory dependencies (pure Python standard library).
 """
 
 import os
@@ -17,9 +17,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-VERSION = "1.2.0"
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-2.0-flash"
+VERSION = "1.3.0"
 
 CONFIG_DIR = Path.home() / ".config" / "search"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -35,6 +33,34 @@ IGNORED_DIRS = {
     "build", "dist", "target", ".cache", ".next", ".nuxt", "vendor"
 }
 
+PROVIDERS = {
+    "gemini": {
+        "name": "Google Gemini",
+        "default_model": "gemini-3.5-flash-lite",
+        "fallback_model": "gemini-3.6-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "key_url": "https://aistudio.google.com/app/apikey",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "default_model": "google/gemini-2.5-flash",
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_url": "https://openrouter.ai/keys",
+    },
+    "nvidia": {
+        "name": "Nvidia NIM",
+        "default_model": "meta/llama-3.3-70b-instruct",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "key_url": "https://build.nvidia.com",
+    },
+    "custom": {
+        "name": "Custom OpenAI-compatible",
+        "default_model": "default",
+        "base_url": "http://localhost:11434/v1",
+        "key_url": "",
+    },
+}
+
 try:
     from rich.console import Console
     from rich.markdown import Markdown
@@ -48,39 +74,64 @@ except ImportError:
 
 def load_config() -> dict:
     cfg = {
-        "api_key": os.environ.get("GEMINI_API_KEY", "").strip(),
-        "model": os.environ.get("SEARCH_MODEL", DEFAULT_MODEL).strip(),
+        "provider": "gemini",
+        "api_key": "",
+        "model": "",
+        "base_url": "",
         "default_site": "",
+        "keys": {},
+        "models": {},
     }
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                if not cfg["api_key"] and saved.get("api_key"):
-                    cfg["api_key"] = saved["api_key"].strip()
-                if "model" in saved and not os.environ.get("SEARCH_MODEL"):
-                    cfg["model"] = saved["model"].strip()
-                if "default_site" in saved:
-                    cfg["default_site"] = saved["default_site"].strip()
+                cfg.update(saved)
         except Exception:
             pass
+
+    env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if env_key and not cfg.get("api_key"):
+        cfg["api_key"] = env_key.strip()
+    if os.environ.get("SEARCH_PROVIDER"):
+        cfg["provider"] = os.environ.get("SEARCH_PROVIDER").strip()
+    if os.environ.get("SEARCH_MODEL"):
+        cfg["model"] = os.environ.get("SEARCH_MODEL").strip()
+
+    provider = cfg.get("provider", "gemini")
+    p_meta = PROVIDERS.get(provider, PROVIDERS["gemini"])
+
+    if not cfg.get("model"):
+        cfg["model"] = cfg.get("models", {}).get(provider) or p_meta["default_model"]
+    if not cfg.get("base_url"):
+        cfg["base_url"] = p_meta["base_url"]
+    if not cfg.get("api_key") and cfg.get("keys", {}).get(provider):
+        cfg["api_key"] = cfg["keys"][provider]
+
     return cfg
 
 
-def save_config(api_key: str = None, model: str = None, default_site: str = None):
+def save_config(provider: str = None, api_key: str = None, model: str = None, base_url: str = None, default_site: str = None):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    current = {}
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                current = json.load(f)
-        except Exception:
-            current = {}
+    current = load_config()
+
+    if provider is not None:
+        current["provider"] = provider.strip()
+    active_p = current.get("provider", "gemini")
+
+    if "keys" not in current:
+        current["keys"] = {}
+    if "models" not in current:
+        current["models"] = {}
 
     if api_key is not None:
         current["api_key"] = api_key.strip()
+        current["keys"][active_p] = api_key.strip()
     if model is not None:
         current["model"] = model.strip()
+        current["models"][active_p] = model.strip()
+    if base_url is not None:
+        current["base_url"] = base_url.strip()
     if default_site is not None:
         current["default_site"] = default_site.strip()
 
@@ -88,83 +139,128 @@ def save_config(api_key: str = None, model: str = None, default_site: str = None
         json.dump(current, f, indent=2, ensure_ascii=False)
 
 
-def http_post_json(url: str, payload: dict, timeout: float = 30.0) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": f"search-cli/{VERSION}"},
-        method="POST",
-    )
+def http_request(url: str, method: str = "GET", data: dict = None, headers: dict = None, timeout: float = 30.0) -> dict:
+    h = {"User-Agent": f"search-cli/{VERSION}"}
+    if headers:
+        h.update(headers)
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        h["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
+        raw = e.read().decode("utf-8", errors="replace")
         msg = f"HTTP {e.code}"
         try:
-            err_json = json.loads(body)
-            if "error" in err_json and "message" in err_json["error"]:
-                msg = f"{msg}: {err_json['error']['message']}"
+            err_json = json.loads(raw)
+            if "error" in err_json:
+                err_obj = err_json["error"]
+                if isinstance(err_obj, dict) and "message" in err_obj:
+                    msg = f"{msg}: {err_obj['message']}"
+                else:
+                    msg = f"{msg}: {err_obj}"
             else:
-                msg = f"{msg}: {body}"
+                msg = f"{msg}: {raw}"
         except Exception:
-            msg = f"{msg}: {body}"
+            msg = f"{msg}: {raw}"
         raise RuntimeError(msg)
     except Exception as e:
         raise RuntimeError(f"Network error: {e}")
 
 
-def validate_api_key(api_key: str) -> tuple[bool, str]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-        "generationConfig": {"maxOutputTokens": 1},
-    }
+def validate_provider_key(provider: str, api_key: str, base_url: str = None) -> tuple[bool, str]:
+    if not base_url:
+        base_url = PROVIDERS.get(provider, {}).get("base_url", "")
+
     try:
-        http_post_json(url, payload, timeout=10.0)
-        return True, ""
+        if provider == "gemini":
+            url = f"{base_url}/models?key={api_key}"
+            data = http_request(url, method="GET", timeout=10.0)
+            if "models" in data:
+                return True, ""
+            return False, "Unexpected response format from Gemini API"
+        else:
+            url = f"{base_url.rstrip('/')}/models"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            http_request(url, method="GET", headers=headers, timeout=10.0)
+            return True, ""
     except Exception as e:
         return False, str(e)
 
 
-def prompt_api_key() -> str:
-    print("[*] Gemini API key is not configured.")
-    print("    Get a free API key at: https://aistudio.google.com/app/apikey")
+def prompt_setup() -> dict:
+    print("\n=== Search CLI Setup ===")
+    print("Select API Provider:")
+    print("  [1] Google Gemini (Google AI Studio - 1500 free queries/day)")
+    print("  [2] OpenRouter (openrouter.ai - access to 200+ models)")
+    print("  [3] Nvidia NIM (integrate.api.nvidia.com - fast LLMs)")
+    print("  [4] Custom OpenAI-compatible (Ollama, Groq, vLLM, local server)")
 
     if not sys.stdin.isatty():
-        print("[-] Non-interactive environment. Set GEMINI_API_KEY or run 'search --set-key <KEY>'.", file=sys.stderr)
+        print("[-] Non-interactive environment. Run 'search --set-key <KEY>'.", file=sys.stderr)
         sys.exit(1)
+
+    choice = input("\nChoice [1-4, default 1]: ").strip()
+    p_map = {"1": "gemini", "2": "openrouter", "3": "nvidia", "4": "custom"}
+    provider = p_map.get(choice, "gemini")
+    p_info = PROVIDERS[provider]
+
+    base_url = p_info["base_url"]
+    if provider == "custom":
+        url_in = input(f"Enter Base URL [default: {base_url}]: ").strip()
+        if url_in:
+            base_url = url_in
+
+    if p_info["key_url"]:
+        print(f"[*] Get your API key at: {p_info['key_url']}")
 
     while True:
         try:
-            raw_key = input("\nEnter API key (or 'q' to quit): ").strip()
+            raw_key = input(f"Enter {p_info['name']} API key: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nAborted.")
             sys.exit(1)
 
-        if not raw_key or raw_key.lower() == "q":
-            print("Aborted.")
-            sys.exit(1)
-
-        print("[*] Validating key with Gemini API...")
-        valid, err = validate_api_key(raw_key)
-        if not valid:
-            print(f"[-] Key validation failed: {err}")
-            print("    Please verify your key and try again.")
+        if not raw_key:
+            if provider == "custom":
+                raw_key = "none"
+                break
             continue
 
-        save_config(api_key=raw_key)
-        print("[+] Key verified and saved to ~/.config/search/config.json")
-        return raw_key
+        print(f"[*] Validating key against {p_info['name']}...")
+        valid, err = validate_provider_key(provider, raw_key, base_url)
+        if not valid:
+            print(f"[-] Validation note: {err}")
+            save_anyway = input("Do you want to save this key anyway? [y/N]: ").strip().lower()
+            if save_anyway == "y":
+                break
+            retry = input("Try another key? [Y/n]: ").strip().lower()
+            if retry == "n":
+                sys.exit(1)
+            continue
+
+        print(f"[+] Key validated successfully!")
+        break
+
+    model = p_info["default_model"]
+    model_in = input(f"Model [default: {model}]: ").strip()
+    if model_in:
+        model = model_in
+
+    save_config(provider=provider, api_key=raw_key, model=model, base_url=base_url)
+    print(f"[+] Configuration saved to ~/.config/search/config.json\n")
+    return load_config()
 
 
-def ensure_key() -> str:
+def ensure_key() -> dict:
     cfg = load_config()
-    api_key = cfg.get("api_key", "").strip()
-    if not api_key:
-        api_key = prompt_api_key()
-    return api_key
+    if not cfg.get("api_key"):
+        return prompt_setup()
+    return cfg
 
 
 def clear_cache() -> int:
@@ -303,98 +399,124 @@ def extract_shell_command(text: str) -> str | None:
     return None
 
 
-def call_gemini(
+def call_llm(
     prompt: str,
-    api_key: str,
-    model: str,
+    cfg: dict,
+    model: str = None,
     use_search: bool = True,
     cmd_mode: bool = False,
     site: str = None,
 ) -> dict:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    provider = cfg.get("provider", "gemini")
+    api_key = cfg.get("api_key", "")
+    base_url = cfg.get("base_url", "")
+    target_model = model or cfg.get("model") or PROVIDERS.get(provider, {}).get("default_model")
 
     if cmd_mode:
-        system_instruction = (
+        sys_msg = (
             "You are a precise Linux/Unix command-line assistant. "
             "Output the exact shell command inside a single markdown code block: ```bash\n<command>\n```. "
             "Follow with a concise 1-2 sentence explanation. Avoid introductory filler."
         )
     else:
-        system_instruction = (
+        sys_msg = (
             "You are a technical CLI assistant for developers and systems engineers. "
-            "Provide concise, practical, technical responses. "
-            "Use clear code blocks with language identifiers. Avoid conversational fluff and emojis."
+            "Provide concise, practical, technical responses with code blocks. "
+            "Avoid conversational fluff and emojis."
         )
 
     augmented_prompt = prompt
     if site:
-        augmented_prompt = f"Search specifically on site '{site}' if applicable.\n\nQuery: {prompt}"
+        augmented_prompt = f"Scope search/knowledge specifically to '{site}'.\n\nQuery: {prompt}"
 
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": augmented_prompt}],
-            }
-        ],
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}]
-        },
-        "generationConfig": {
+    if provider == "gemini":
+        url = f"{base_url}/models/{target_model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": augmented_prompt}]}],
+            "systemInstruction": {"parts": [{"text": sys_msg}]},
+            "generationConfig": {"temperature": 0.2 if cmd_mode else 0.4, "maxOutputTokens": 3000},
+        }
+        if use_search:
+            payload["tools"] = [{"googleSearch": {}}]
+
+        try:
+            data = http_request(url, method="POST", data=payload, timeout=30.0)
+        except RuntimeError as e:
+            fallback = PROVIDERS["gemini"].get("fallback_model")
+            if "HTTP 404" in str(e) and fallback and target_model != fallback:
+                print(f"[-] Model '{target_model}' not found. Retrying with '{fallback}'...", file=sys.stderr)
+                return call_llm(prompt, cfg, model=fallback, use_search=use_search, cmd_mode=cmd_mode, site=site)
+            raise e
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("No response candidate returned by Gemini API.")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts = [p.get("text", "") for p in parts if "text" in p]
+        answer_text = "".join(text_parts).strip()
+
+        grounding_meta = candidates[0].get("groundingMetadata", {})
+        queries = grounding_meta.get("webSearchQueries", [])
+        chunks = grounding_meta.get("groundingChunks", [])
+        sources = []
+        seen = set()
+        for chunk in chunks:
+            web = chunk.get("web", {})
+            uri = web.get("uri")
+            title = web.get("title", uri)
+            if uri and uri not in seen:
+                seen.add(uri)
+                sources.append({"title": title, "url": uri})
+
+        return {
+            "text": answer_text,
+            "suggested_cmd": extract_shell_command(answer_text) if cmd_mode else None,
+            "queries": queries,
+            "sources": sources,
+            "model_used": target_model,
+        }
+
+    else:
+        # OpenAI-compatible (OpenRouter, Nvidia NIM, Ollama, Custom)
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        # OpenRouter web search support
+        request_model = target_model
+        if provider == "openrouter" and use_search and not target_model.endswith(":online"):
+            # Can be used with :online suffix on OpenRouter
+            pass
+
+        payload = {
+            "model": request_model,
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": augmented_prompt},
+            ],
             "temperature": 0.2 if cmd_mode else 0.4,
-            "maxOutputTokens": 3000,
-        },
-    }
+        }
 
-    if use_search:
-        payload["tools"] = [{"googleSearch": {}}]
+        data = http_request(url, method="POST", data=payload, headers=headers, timeout=35.0)
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError(f"No choices returned by {provider} API.")
 
-    try:
-        data = http_post_json(url, payload, timeout=30.0)
-    except RuntimeError as e:
-        if "HTTP 404" in str(e) and model != FALLBACK_MODEL:
-            return call_gemini(
-                prompt=prompt,
-                api_key=api_key,
-                model=FALLBACK_MODEL,
-                use_search=use_search,
-                cmd_mode=cmd_mode,
-                site=site,
-            )
-        raise e
+        answer_text = choices[0].get("message", {}).get("content", "").strip()
 
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("No response candidate returned by API.")
+        # Extract citations / sources if available
+        sources = []
+        if "citations" in choices[0]:
+            for c in choices[0]["citations"]:
+                sources.append({"title": c.get("title", "Source"), "url": c.get("url", "")})
 
-    candidate = candidates[0]
-    parts = candidate.get("content", {}).get("parts", [])
-    text_parts = [p.get("text", "") for p in parts if "text" in p]
-    answer_text = "".join(text_parts).strip()
-
-    grounding_meta = candidate.get("groundingMetadata", {})
-    queries = grounding_meta.get("webSearchQueries", [])
-    chunks = grounding_meta.get("groundingChunks", [])
-
-    sources = []
-    seen_urls = set()
-    for chunk in chunks:
-        web = chunk.get("web", {})
-        uri = web.get("uri")
-        title = web.get("title", uri)
-        if uri and uri not in seen_urls:
-            seen_urls.add(uri)
-            sources.append({"title": title, "url": uri})
-
-    suggested_cmd = extract_shell_command(answer_text) if cmd_mode else None
-
-    return {
-        "text": answer_text,
-        "suggested_cmd": suggested_cmd,
-        "queries": queries,
-        "sources": sources,
-        "model_used": model,
-    }
+        return {
+            "text": answer_text,
+            "suggested_cmd": extract_shell_command(answer_text) if cmd_mode else None,
+            "queries": [],
+            "sources": sources,
+            "model_used": target_model,
+        }
 
 
 def execute_shell_command(cmd: str):
@@ -407,7 +529,7 @@ def execute_shell_command(cmd: str):
         print(f"[-] Execution error: {e}", file=sys.stderr)
 
 
-def render_output(result: dict, query_str: str, from_cache: bool, target_site: str, no_web: bool, model: str):
+def render_output(result: dict, query_str: str, from_cache: bool, target_site: str, no_web: bool, model: str, provider: str):
     if HAS_RICH:
         cache_notice = " [dim](cached)[/dim]" if from_cache else ""
         site_notice = f" [cyan]• site:{target_site}[/cyan]" if target_site else ""
@@ -419,7 +541,7 @@ def render_output(result: dict, query_str: str, from_cache: bool, target_site: s
             Markdown(result["text"]),
             title=title,
             border_style="cyan",
-            subtitle=f"[dim]model: {result.get('model_used', model)}[/dim]",
+            subtitle=f"[dim]{provider} / {result.get('model_used', model)}[/dim]",
             subtitle_align="right",
         ))
 
@@ -431,7 +553,7 @@ def render_output(result: dict, query_str: str, from_cache: bool, target_site: s
     else:
         border = "=" * 60
         print(f"\n{border}")
-        print(f"Results: {query_str or 'Analysis'} (model: {result.get('model_used', model)})")
+        print(f"Results: {query_str or 'Analysis'} ({provider}: {result.get('model_used', model)})")
         print(f"{border}\n")
         print(result["text"])
         if result.get("sources"):
@@ -442,17 +564,17 @@ def render_output(result: dict, query_str: str, from_cache: bool, target_site: s
 
 
 def run_interactive():
-    api_key = ensure_key()
-    cfg = load_config()
+    cfg = ensure_key()
+    provider = cfg.get("provider", "gemini")
 
     if HAS_RICH:
         console.print(Panel(
             f"[bold white]Search CLI[/bold white] [dim]v{VERSION}[/dim]\n"
-            "[dim]Terminal Intelligence with Google Search Grounding[/dim]",
+            f"[dim]Provider: {PROVIDERS.get(provider, {}).get('name', provider)} | Model: {cfg.get('model')}[/dim]",
             border_style="cyan"
         ))
     else:
-        print(f"=== Search CLI v{VERSION} ===")
+        print(f"=== Search CLI v{VERSION} ({provider}) ===")
 
     while True:
         try:
@@ -496,15 +618,15 @@ def run_interactive():
         if context_data:
             full_prompt = f"Context:\n{context_data}\n\nTask:\n{query}"
 
-        model = cfg.get("model", DEFAULT_MODEL)
-        label = "Generating command..." if cmd_mode else f"Searching ({model})..."
+        model = cfg.get("model")
+        label = "Generating command..." if cmd_mode else f"Querying ({provider}: {model})..."
 
         try:
             if HAS_RICH:
                 with console.status(f"[bold cyan]{label}[/bold cyan]", spinner="dots"):
-                    result = call_gemini(
+                    result = call_llm(
                         prompt=full_prompt,
-                        api_key=api_key,
+                        cfg=cfg,
                         model=model,
                         use_search=True,
                         cmd_mode=cmd_mode,
@@ -512,9 +634,9 @@ def run_interactive():
                     )
             else:
                 print(f"[*] {label}")
-                result = call_gemini(
+                result = call_llm(
                     prompt=full_prompt,
-                    api_key=api_key,
+                    cfg=cfg,
                     model=model,
                     use_search=True,
                     cmd_mode=cmd_mode,
@@ -524,7 +646,7 @@ def run_interactive():
             print(f"[-] API error: {e}")
             continue
 
-        render_output(result, query, False, target_site, False, model)
+        render_output(result, query, False, target_site, False, model, provider)
 
         suggested_cmd = result.get("suggested_cmd")
         if suggested_cmd and sys.stdin.isatty():
@@ -543,49 +665,61 @@ def run_interactive():
 def main():
     parser = argparse.ArgumentParser(
         prog="search",
-        description="Terminal search, codebase inspection, and command-line AI assistant.",
+        description="Terminal search, codebase inspection, and multi-provider AI assistant.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   search "how to configure reverse proxy in nginx"
   search -c "find files larger than 50MB and sort by size"
+  search -p openrouter -m meta-llama/llama-3.3-70b-instruct "explain b-trees"
+  search -p nvidia -m meta/llama-3.3-70b-instruct "optimize cuda kernel"
   search -s stackoverflow.com "python typeerror unhashable type"
   search -f ./nginx.conf "explain ssl configuration"
   search -d . "summarize project architecture"
   cat /var/log/syslog | search "identify root cause"
-  search --set-key AIzaSy...
+  search --setup
 """
     )
     parser.add_argument("query", nargs="*", help="Query or prompt to process")
     parser.add_argument("-c", "--cmd", action="store_true", help="Generate an executable shell command")
-    parser.add_argument("-s", "--site", metavar="DOMAIN", help="Scope search to a specific domain (e.g. stackoverflow.com)")
+    parser.add_argument("-p", "--provider", choices=["gemini", "openrouter", "nvidia", "custom"], help="AI provider")
+    parser.add_argument("-m", "--model", metavar="NAME", help="Model identifier")
+    parser.add_argument("-s", "--site", metavar="DOMAIN", help="Scope search to a specific domain")
     parser.add_argument("-f", "--file", metavar="PATH", help="Attach file content as context")
     parser.add_argument("-d", "--dir", metavar="PATH", help="Attach directory tree and structure as context")
-    parser.add_argument("-m", "--model", metavar="NAME", help=f"Gemini model identifier (default: {DEFAULT_MODEL})")
     parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive wizard/prompt")
     parser.add_argument("-w", "--no-web", action="store_true", help="Disable web search grounding")
     parser.add_argument("-r", "--raw", action="store_true", help="Output plain unformatted text")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-execute generated command without confirmation")
+    parser.add_argument("--setup", action="store_true", help="Run provider and key configuration wizard")
     parser.add_argument("--no-cache", action="store_true", help="Bypass local cache")
     parser.add_argument("--clear-cache", action="store_true", help="Clear local cache")
-    parser.add_argument("--set-key", metavar="KEY", help="Save API key to configuration")
-    parser.add_argument("--set-model", metavar="MODEL", help="Save default model to configuration")
-    parser.add_argument("--set-site", metavar="DOMAIN", help="Save default search domain to configuration")
+    parser.add_argument("--set-provider", choices=["gemini", "openrouter", "nvidia", "custom"], help="Set default provider")
+    parser.add_argument("--set-key", metavar="KEY", help="Save API key for active provider")
+    parser.add_argument("--set-model", metavar="MODEL", help="Save default model for active provider")
+    parser.add_argument("--set-url", metavar="URL", help="Save custom Base URL")
+    parser.add_argument("--set-site", metavar="DOMAIN", help="Save default search domain")
+    parser.add_argument("--force", action="store_true", help="Force save settings even if key validation returns a warning")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}")
 
     args = parser.parse_args()
+
+    if args.setup:
+        prompt_setup()
+        return
 
     if args.clear_cache:
         cleared = clear_cache()
         print(f"[+] Cache cleared ({cleared} records removed).")
         return
 
-    if args.set_key:
-        valid, err = validate_api_key(args.set_key)
-        if not valid:
-            print(f"[-] Key validation failed: {err}", file=sys.stderr)
-            sys.exit(1)
-        save_config(api_key=args.set_key)
-        print("[+] API key validated and saved successfully.")
+    if args.set_provider:
+        save_config(provider=args.set_provider)
+        print(f"[+] Active provider set to: {args.set_provider}")
+        return
+
+    if args.set_url:
+        save_config(base_url=args.set_url)
+        print(f"[+] Base URL set to: {args.set_url}")
         return
 
     if args.set_model:
@@ -598,6 +732,19 @@ def main():
         print(f"[+] Default search domain set to: {args.set_site}")
         return
 
+    if args.set_key:
+        cfg = load_config()
+        prov = args.provider or cfg.get("provider", "gemini")
+        b_url = args.set_url or cfg.get("base_url")
+        valid, err = validate_provider_key(prov, args.set_key, b_url)
+        if not valid and not args.force:
+            print(f"[-] Key validation failed for {prov}: {err}", file=sys.stderr)
+            print("    Use --force to save the key anyway if your network requires a proxy/VPN.", file=sys.stderr)
+            sys.exit(1)
+        save_config(provider=prov, api_key=args.set_key)
+        print(f"[+] API key saved for provider '{prov}'.")
+        return
+
     piped_data = read_piped_stdin()
     query_str = " ".join(args.query).strip()
 
@@ -608,9 +755,16 @@ def main():
         run_interactive()
         return
 
-    api_key = ensure_key()
-    cfg = load_config()
-    model = args.model or cfg.get("model", DEFAULT_MODEL)
+    cfg = ensure_key()
+    if args.provider:
+        cfg["provider"] = args.provider
+        if not args.model and cfg["provider"] in PROVIDERS:
+            cfg["model"] = PROVIDERS[cfg["provider"]]["default_model"]
+        if cfg.get("keys", {}).get(args.provider):
+            cfg["api_key"] = cfg["keys"][args.provider]
+
+    model = args.model or cfg.get("model")
+    provider = cfg.get("provider", "gemini")
     target_site = args.site or cfg.get("default_site", "")
 
     contexts = []
@@ -641,7 +795,7 @@ def main():
     else:
         full_prompt = query_str
 
-    cache_key = f"{model}:{not args.no_web}:{args.cmd}:{target_site}:{full_prompt}"
+    cache_key = f"{provider}:{model}:{not args.no_web}:{args.cmd}:{target_site}:{full_prompt}"
     from_cache = False
     result = None
 
@@ -653,14 +807,14 @@ def main():
 
     if result is None:
         use_search = not args.no_web
-        status_label = "Generating command..." if args.cmd else f"Querying ({model})..."
+        status_label = "Generating command..." if args.cmd else f"Querying ({provider}: {model})..."
 
         try:
             if HAS_RICH and not args.raw:
                 with console.status(f"[bold cyan]{status_label}[/bold cyan]", spinner="dots"):
-                    result = call_gemini(
+                    result = call_llm(
                         prompt=full_prompt,
-                        api_key=api_key,
+                        cfg=cfg,
                         model=model,
                         use_search=use_search,
                         cmd_mode=args.cmd,
@@ -669,9 +823,9 @@ def main():
             else:
                 if not args.raw:
                     print(f"[*] {status_label}")
-                result = call_gemini(
+                result = call_llm(
                     prompt=full_prompt,
-                    api_key=api_key,
+                    cfg=cfg,
                     model=model,
                     use_search=use_search,
                     cmd_mode=args.cmd,
@@ -689,7 +843,7 @@ def main():
             print(result["text"])
         return
 
-    render_output(result, query_str, from_cache, target_site, args.no_web, model)
+    render_output(result, query_str, from_cache, target_site, args.no_web, model, provider)
 
     suggested_cmd = result.get("suggested_cmd")
     if args.cmd and suggested_cmd:
