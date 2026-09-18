@@ -15,9 +15,43 @@ import argparse
 import subprocess
 import urllib.request
 import urllib.error
+import threading
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
+
+class PipxSpinner:
+    """Braille dots spinner mimicking pipx and modern terminal animation."""
+    FRAMES = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"]
+
+    def __init__(self, message="Processing..."):
+        self.message = message
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def _spin(self):
+        idx = 0
+        while not self.stop_event.is_set():
+            frame = self.FRAMES[idx % len(self.FRAMES)]
+            sys.stdout.write(f"\r\033[36m{frame}\033[0m {self.message} ")
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(0.08)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        if sys.stdout.isatty():
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
+        else:
+            print(f"[*] {self.message}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.thread:
+            self.stop_event.set()
+            self.thread.join()
 
 CONFIG_DIR = Path.home() / ".config" / "search"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -245,6 +279,11 @@ def prompt_setup() -> dict:
 
         print(f"[+] Key validated successfully!")
         break
+
+    if provider == "gemini":
+        print("\n[*] Note: gemini-3.5-flash-lite provides live Google Search and fastest speed,")
+        print("    but has lighter reasoning. For complex code/architecture, gemini-3.6-flash is recommended.")
+        print("    Options: gemini-3.5-flash-lite (fast), gemini-3.6-flash (smarter)")
 
     model = p_info["default_model"]
     model_in = input(f"Model [default: {model}]: ").strip()
@@ -622,18 +661,7 @@ def run_interactive():
         label = "Generating command..." if cmd_mode else f"Querying ({provider}: {model})..."
 
         try:
-            if HAS_RICH:
-                with console.status(f"[bold cyan]{label}[/bold cyan]", spinner="dots"):
-                    result = call_llm(
-                        prompt=full_prompt,
-                        cfg=cfg,
-                        model=model,
-                        use_search=True,
-                        cmd_mode=cmd_mode,
-                        site=target_site or None,
-                    )
-            else:
-                print(f"[*] {label}")
+            with PipxSpinner(label):
                 result = call_llm(
                     prompt=full_prompt,
                     cfg=cfg,
@@ -810,8 +838,8 @@ def main():
         status_label = "Generating command..." if args.cmd else f"Querying ({provider}: {model})..."
 
         try:
-            if HAS_RICH and not args.raw:
-                with console.status(f"[bold cyan]{status_label}[/bold cyan]", spinner="dots"):
+            if not args.raw:
+                with PipxSpinner(status_label):
                     result = call_llm(
                         prompt=full_prompt,
                         cfg=cfg,
@@ -821,8 +849,6 @@ def main():
                         site=target_site or None,
                     )
             else:
-                if not args.raw:
-                    print(f"[*] {status_label}")
                 result = call_llm(
                     prompt=full_prompt,
                     cfg=cfg,
